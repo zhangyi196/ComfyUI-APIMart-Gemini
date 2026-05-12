@@ -4,20 +4,27 @@
 
 ## 项目简介
 
-当前仓库提供 1 个自定义节点：
+当前仓库提供 3 个自定义节点：
 
 - `Gemini Image Generation (APImart)`
+- `GPT Image 2 Generation (APImart)`
+- `GPT Image 2 Official (APImart)`
 
 支持能力：
 
 - 文生图
 - 图生图，最多支持 10 张参考图
+- GPT-Image-2 文生图
+- GPT-Image-2 图生图，最多支持 10 张参考图
+- GPT-Image-2 Official 文生图、图生图与局部重绘
 - 轮询 APImart 异步任务直到完成
 - 下载生成结果并返回给 ComfyUI
 
 ## 文件说明
 
 - `gemini_node.py`：ComfyUI 节点的主要实现
+- `gpt_image_2_node.py`：GPT-Image-2 节点实现
+- `gpt_image_2_official_node.py`：GPT-Image-2 Official 节点实现
 - `__init__.py`：导出 ComfyUI 所需的节点映射
 - `requirements.txt`：本项目依赖列表
 
@@ -52,7 +59,7 @@ ComfyUI/custom_nodes/ComfyUI-APIMart-Gemini
 
 ## 节点输入
 
-必填输入：
+`Gemini Image Generation (APImart)`：
 
 - `mode`：`text-to-image` 或 `image-to-image`
 - `api_key`：APImart API Key
@@ -62,10 +69,38 @@ ComfyUI/custom_nodes/ComfyUI-APIMart-Gemini
 - `resolution`：输出分辨率
 - `size`：画面比例
 - `seed`：可选随机种子
-
-可选输入：
-
 - `image_1` 到 `image_10`：`image-to-image` 模式下使用的参考图
+
+`GPT Image 2 Generation (APImart)`：
+
+- `mode`：`text-to-image` 或 `image-to-image`
+- `api_key`：APImart API Key
+- `prompt`：生成提示词
+- `model`：固定为 `gpt-image-2`
+- `n`：当前按文档固定为 `1`
+- `size`：支持 `auto` 与多种比例
+- `resolution`：支持 `1k`、`2k`、`4k`
+- `official_fallback`：是否启用官方兜底
+- `seed`：可选随机种子
+- `image_1` 到 `image_10`：`image-to-image` 模式下使用的参考图
+
+`GPT Image 2 Official (APImart)`：
+
+- `mode`：`text-to-image` 或 `image-to-image`
+- `api_key`：APImart API Key
+- `prompt`：生成提示词
+- `model`：固定为 `gpt-image-2-official`
+- `n`：支持 `1` 到 `4`
+- `size`：支持 `auto` 与多种比例
+- `resolution`：支持 `1k`、`2k`、`4k`，其中 `2k/4k` 仅适用于部分宽高比
+- `quality`：支持 `low`、`medium`、`high`、`auto`
+- `background`：支持 `auto`、`opaque`、`transparent`
+- `moderation`：支持 `auto`、`low`
+- `output_format`：支持 `png`、`jpeg`、`webp`
+- `output_compression`：输出压缩质量，`jpeg/webp` 生效，PNG 时固定为 `100`
+- `seed`：可选随机种子
+- `image_1` 到 `image_10`：`image-to-image` 模式下使用的参考图
+- `mask_image`：局部重绘使用的遮罩图
 
 ## 节点输出
 
@@ -75,7 +110,7 @@ ComfyUI/custom_nodes/ComfyUI-APIMart-Gemini
 
 ## 使用方法
 
-1. 在 ComfyUI 中添加 `Gemini Image Generation (APImart)` 节点。
+1. 在 ComfyUI 中添加 `Gemini Image Generation (APImart)`、`GPT Image 2 Generation (APImart)` 或 `GPT Image 2 Official (APImart)` 节点。
 2. 输入你的 APImart API Key。
 3. 选择模型和生成模式。
 4. 如果使用 `image-to-image`，连接一张或多张输入图像。

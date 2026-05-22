@@ -31,3 +31,15 @@ Thumbs.db
 *.log
 tmp/
 temp/
+
+# Claude / Maestro 运行产物
+.claude/
+.workflow/.roadmap/
+.workflow/issues/
+.workflow/scratch/
+.workflow/wiki-index.json
+.workflow/roadmap.md
+
+# 临时参考文档
+/reach ai 图像url上传文档.md
+/reach api image2接口文档.md

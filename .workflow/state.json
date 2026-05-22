@@ -1,12 +1,77 @@
 {
   "version": "2.0",
   "project_name": "ComfyUI-APIMart-Gemini",
-  "status": "idle",
-  "current_milestone": null,
+  "status": "verifying",
+  "current_milestone": "M1",
   "current_task_id": null,
-  "milestones": [],
-  "artifacts": [],
-  "last_updated": "2026-05-18T00:00:00+08:00",
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "OpenAI 上传链路稳定化",
+      "status": "not_started",
+      "phases": [
+        {
+          "phase": 1,
+          "title": "OpenAI 上传链路稳定化",
+          "status": "not_started"
+        }
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "type": "brainstorm",
+      "id": "brainstorm-openai-upload-alternative-20260522",
+      "path": "scratch/brainstorm-openai-upload-alternative-20260522",
+      "title": "OpenAI 模式替代 base64 的图像上传新方案",
+      "status": "completed",
+      "created_at": "2026-05-22T00:00:00+08:00",
+      "updated_at": "2026-05-22T00:00:00+08:00"
+    },
+    {
+      "type": "plan",
+      "id": "PLN-001",
+      "path": "scratch/20260522-plan-P1-openai-upload-stabilize",
+      "title": "Phase 1: OpenAI 上传链路稳定化",
+      "milestone": "M1",
+      "phase": 1,
+      "scope": "phase",
+      "status": "completed",
+      "depends_on": ["brainstorm-openai-upload-alternative-20260522"],
+      "harvested": false,
+      "created_at": "2026-05-22T14:00:00+08:00",
+      "completed_at": "2026-05-22T14:00:00+08:00"
+    },
+    {
+      "type": "execute",
+      "id": "EXC-001",
+      "path": "scratch/20260522-plan-P1-openai-upload-stabilize",
+      "title": "Execution: Phase 1 OpenAI 上传链路稳定化",
+      "milestone": "M1",
+      "phase": 1,
+      "scope": "phase",
+      "status": "completed",
+      "depends_on": ["PLN-001"],
+      "harvested": true,
+      "created_at": "2026-05-22T17:03:09.399208+08:00",
+      "completed_at": "2026-05-22T17:03:09.399208+08:00"
+    },
+    {
+      "type": "analyze",
+      "id": "ANL-001",
+      "path": "scratch/analyze-async-mode-node-20260522",
+      "title": "Analyze: GPT Image 2 Official async mode",
+      "milestone": "M1",
+      "phase": null,
+      "scope": "adhoc",
+      "status": "completed",
+      "depends_on": [],
+      "harvested": false,
+      "created_at": "2026-05-22T17:38:53.066874+08:00",
+      "completed_at": "2026-05-22T17:38:53.066874+08:00"
+    }
+  ],
+  "last_updated": "2026-05-22T17:38:53.066874+08:00",
   "accumulated_context": {
     "key_decisions": [],
     "blockers": [],

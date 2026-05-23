@@ -78,7 +78,7 @@ class CPAGPTImage2GenerationNode:
                 "base_url": ("STRING", {"multiline": False, "default": cls.DEFAULT_BASE_URL}),
                 "prompt": ("STRING", {"multiline": True}),
                 "model": ([cls.MODEL_NAME], {"default": cls.MODEL_NAME}),
-                "size": (["1024x1024", "1536x1024", "1024x1536", "1360x1024", "1024x1360", "1824x1024", "1024x1824"], {"default": "1024x1024"}),
+                "size": (["1024x1024", "1536x1024", "1024x1536", "1360x1024", "1024x1360", "1824x1024", "1024x1824", "2048x2048", "2048x1152", "2048x1536", "1536x2048", "3840x2160", "2160x3840", "3840x2880", "2880x3840"], {"default": "1024x1024"}),
                 "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
                 "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
                 "moderation": (["auto", "low"], {"default": "auto"}),

@@ -16,6 +16,46 @@ except ImportError:
     torch = None
 
 
+def _find_first_url(data: Any) -> str:
+    """递归查找 JSON 中第一个 https URL（兜底策略）。"""
+    if isinstance(data, str) and data.startswith("https://"):
+        return data
+    if isinstance(data, dict):
+        for v in data.values():
+            result = _find_first_url(v)
+            if result:
+                return result
+    if isinstance(data, list):
+        for item in data:
+            result = _find_first_url(item)
+            if result:
+                return result
+    return ""
+
+
+def _extract_upload_url(response_data: Dict[str, Any]) -> str:
+    """自适应上传响应解析 — 支持 Reach、APIMart 及未知格式。
+
+    优先级：
+    1. 有 code 字段 → Reach 格式（校验 code=200，提取 data.url）
+    2. 顶层有 url   → APIMart 格式（直接返回）
+    3. 递归查找第一个 https:// 开头的值（兜底）
+    """
+    if "code" in response_data:
+        if response_data.get("code") != 200:
+            raise ValueError(f"参考图上传失败: {response_data}")
+        data = response_data.get("data", {})
+        url = data.get("url")
+        if url:
+            return url
+
+    url = response_data.get("url")
+    if isinstance(url, str) and url:
+        return url
+
+    return _find_first_url(response_data)
+
+
 class CPAGPTImage2GenerationNode:
     """ComfyUI node for CPA GPT Image 2 async generation."""
 
@@ -248,13 +288,9 @@ class CPAGPTImage2GenerationNode:
         response_data = response.json()
         print(f"[CPAGPTImage2Node] 上传响应 {index}: {json.dumps(response_data, ensure_ascii=False)}")
 
-        if response_data.get("code") != 200:
-            raise ValueError(f"参考图上传失败: {response_data}")
-
-        data = response_data.get("data", {})
-        image_url = data.get("url")
+        image_url = _extract_upload_url(response_data)
         if not image_url:
-            raise ValueError(f"上传响应缺少 url: {response_data}")
+            raise ValueError(f"上传响应无法解析 URL: {response_data}")
         if not image_url.startswith("https://"):
             raise ValueError(f"上传后返回的 url 不是 https 地址: {image_url}")
         return image_url

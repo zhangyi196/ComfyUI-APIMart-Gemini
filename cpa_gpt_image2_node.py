@@ -98,7 +98,7 @@ class CPAGPTImage2GenerationNode:
                 "resolution": (["1k", "2k", "4k"], {"default": "1k"}),
                 "aspect_ratio": (["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16"], {"default": "1:1"}),
                 "async_mode": ("BOOLEAN", {"default": False, "label_on": "async", "label_off": "sync"}),
-                "async_backend_url": ("STRING", {"multiline": False, "default": "https://api.reachapi.ai"}),
+                "async_backend_url": ("STRING", {"multiline": False, "default": "https://api.reachapi.ai/v1/images/create"}),
                 "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
                 "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
                 "moderation": (["auto", "low"], {"default": "auto"}),
@@ -450,17 +450,21 @@ class CPAGPTImage2GenerationNode:
         except Exception as exc:
             raise RuntimeError(f"下载结果图片失败: {exc}") from exc
 
-    def build_async_submit_url(self, async_backend_url: str) -> str:
-        normalized = async_backend_url.strip().rstrip("/")
-        if normalized.endswith("/v1/images/create"):
-            return normalized
-        return f"{normalized}/v1/images/create"
+    def resolve_async_backend_url(self, async_backend_url: str) -> str:
+        """归一化异步后端地址 —— 仅补全 scheme，不做路径改写。"""
+        normalized = async_backend_url.strip()
+        if not normalized:
+            raise ValueError("async_backend_url 不能为空")
+        if "://" not in normalized:
+            normalized = f"https://{normalized.lstrip('/')}"
+        return normalized.rstrip("/")
 
-    def build_async_query_url(self, async_backend_url: str) -> str:
-        normalized = async_backend_url.strip().rstrip("/")
-        if normalized.endswith("/v1/tasks"):
-            return normalized
-        return f"{normalized}/v1/tasks"
+    def build_async_query_url(self, submit_url: str) -> str:
+        """从提交地址推导查询地址，将末两段替换为 tasks。"""
+        parts = urlsplit(submit_url)
+        path_parts = parts.path.rstrip("/").split("/")
+        query_path = "/".join(path_parts[:-2] + ["tasks"])
+        return urlunsplit((parts.scheme, parts.netloc, query_path, parts.query, parts.fragment))
 
     def build_async_payload(
         self,
@@ -548,8 +552,8 @@ class CPAGPTImage2GenerationNode:
             )
 
             if async_mode:
-                submit_url = self.build_async_submit_url(async_backend_url)
-                query_url = self.build_async_query_url(async_backend_url)
+                submit_url = self.resolve_async_backend_url(async_backend_url)
+                query_url = self.build_async_query_url(submit_url)
                 payload = self.build_async_payload(
                     model=model,
                     prompt=prompt,

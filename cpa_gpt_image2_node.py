@@ -97,6 +97,8 @@ class CPAGPTImage2GenerationNode:
                 "model": ([cls.MODEL_NAME], {"default": cls.MODEL_NAME}),
                 "resolution": (["1k", "2k", "4k"], {"default": "1k"}),
                 "aspect_ratio": (["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16"], {"default": "1:1"}),
+                "async_mode": ("BOOLEAN", {"default": False, "label_on": "async", "label_off": "sync"}),
+                "async_backend_url": ("STRING", {"multiline": False, "default": "https://api.reachapi.ai"}),
                 "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
                 "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
                 "moderation": (["auto", "low"], {"default": "auto"}),
@@ -448,6 +450,59 @@ class CPAGPTImage2GenerationNode:
         except Exception as exc:
             raise RuntimeError(f"下载结果图片失败: {exc}") from exc
 
+    def build_async_submit_url(self, async_backend_url: str) -> str:
+        normalized = async_backend_url.strip().rstrip("/")
+        if normalized.endswith("/v1/images/create"):
+            return normalized
+        return f"{normalized}/v1/images/create"
+
+    def build_async_query_url(self, async_backend_url: str) -> str:
+        normalized = async_backend_url.strip().rstrip("/")
+        if normalized.endswith("/v1/tasks"):
+            return normalized
+        return f"{normalized}/v1/tasks"
+
+    def build_async_payload(
+        self,
+        model: str,
+        prompt: str,
+        resolution: str,
+        aspect_ratio: str,
+        quality: str,
+        background: str,
+        moderation: str,
+        output_format: str,
+        custom_size: str,
+        image_urls: List[str],
+        callback_url: str,
+    ) -> Dict[str, Any]:
+        input_payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "quality": quality,
+            "background": background,
+            "moderation": moderation,
+            "output_format": output_format,
+        }
+
+        normalized_size = custom_size.strip()
+        if normalized_size:
+            input_payload["size"] = normalized_size
+        else:
+            input_payload["resolution"] = resolution
+            input_payload["aspect_ratio"] = aspect_ratio
+
+        if image_urls:
+            input_payload["image_urls"] = image_urls
+
+        payload: Dict[str, Any] = {
+            "model": f"{model}-async",
+            "input": input_payload,
+        }
+        if callback_url:
+            payload["callback_url"] = callback_url
+
+        return payload
+
     def generate(
         self,
         mode: str,
@@ -457,6 +512,8 @@ class CPAGPTImage2GenerationNode:
         model: str,
         resolution: str,
         aspect_ratio: str,
+        async_mode: bool,
+        async_backend_url: str,
         quality: str,
         background: str,
         moderation: str,
@@ -464,11 +521,7 @@ class CPAGPTImage2GenerationNode:
         **kwargs: Any,
     ) -> Tuple[Any, str, str]:
         try:
-            print(f"[CPAGPTImage2Node] 开始生成，模式: {mode}")
-            submit_url = self.build_submit_url(base_url, mode)
-            query_url = self.build_query_url(submit_url)
-            print(f"[CPAGPTImage2Node] 提交地址: {submit_url}")
-            print(f"[CPAGPTImage2Node] 查询地址: {query_url}")
+            print(f"[CPAGPTImage2Node] 开始生成，模式: {mode}, 异步: {async_mode}")
 
             reference_images = self.collect_images(**kwargs)
             custom_size = kwargs.get("custom_size", "")
@@ -493,24 +546,43 @@ class CPAGPTImage2GenerationNode:
                 if reference_images
                 else []
             )
-            input_payload = self.build_input_payload(
-                prompt=prompt,
-                resolution=resolution,
-                aspect_ratio=aspect_ratio,
-                quality=quality,
-                background=background,
-                moderation=moderation,
-                output_format=output_format,
-                custom_size=custom_size,
-                image_urls=image_urls,
-            )
 
-            payload: Dict[str, Any] = {
-                "model": model,
-                **input_payload,
-            }
-            if callback_url:
-                payload["callback_url"] = callback_url
+            if async_mode:
+                submit_url = self.build_async_submit_url(async_backend_url)
+                query_url = self.build_async_query_url(async_backend_url)
+                payload = self.build_async_payload(
+                    model=model,
+                    prompt=prompt,
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    quality=quality,
+                    background=background,
+                    moderation=moderation,
+                    output_format=output_format,
+                    custom_size=custom_size,
+                    image_urls=image_urls,
+                    callback_url=callback_url,
+                )
+            else:
+                submit_url = self.build_submit_url(base_url, mode)
+                query_url = self.build_query_url(submit_url)
+                input_payload = self.build_input_payload(
+                    prompt=prompt,
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    quality=quality,
+                    background=background,
+                    moderation=moderation,
+                    output_format=output_format,
+                    custom_size=custom_size,
+                    image_urls=image_urls,
+                )
+                payload = {"model": model, **input_payload}
+                if callback_url:
+                    payload["callback_url"] = callback_url
+
+            print(f"[CPAGPTImage2Node] 提交地址: {submit_url}")
+            print(f"[CPAGPTImage2Node] 查询地址: {query_url}")
 
             headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -532,17 +604,25 @@ class CPAGPTImage2GenerationNode:
             sanitized_response_data = self.sanitize_response_data(response_data)
             print(f"[CPAGPTImage2Node] 提交响应: {json.dumps(sanitized_response_data, ensure_ascii=False)}")
 
-            task_id = self.extract_task_id(response_data)
-            if task_id:
+            if async_mode:
+                task_id = response_data.get("task_id")
+                if not task_id:
+                    raise ValueError(f"异步模式需要 task_id，但响应中未包含: {response_data}")
                 image_url, final_response = self.poll_task_status(task_id, api_key, query_url)
                 result_image = self.download_image(image_url)
             else:
-                result_image, image_url = self.extract_sync_result(response_data)
-                final_response = response_data
+                task_id = self.extract_task_id(response_data)
+                if task_id:
+                    image_url, final_response = self.poll_task_status(task_id, api_key, query_url)
+                    result_image = self.download_image(image_url)
+                else:
+                    result_image, image_url = self.extract_sync_result(response_data)
+                    final_response = response_data
 
             result_tensor = self.pil_to_tensor(result_image)
             response_text = json.dumps(
                 {
+                    "async_mode": async_mode,
                     "submit_url": submit_url,
                     "query_url": query_url,
                     "upload_url": upload_url,

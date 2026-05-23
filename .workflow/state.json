@@ -99,9 +99,16 @@
       "completed_at": "2026-05-23T15:00:00+08:00",
       "directory": ".workflow/scratch/quick-pixel-size-dropdown-2026-05-23",
       "verified": "skipped"
+    },
+    {
+      "id": "quick-async-mode-switch-2026-05-23",
+      "description": "CPA节点新增异步模式开关",
+      "completed_at": "2026-05-23T15:30:00+08:00",
+      "directory": ".workflow/scratch/quick-async-mode-switch-2026-05-23",
+      "verified": "skipped"
     }
   ],
-  "last_updated": "2026-05-23T15:00:00+08:00",
+  "last_updated": "2026-05-23T15:30:00+08:00",
   "accumulated_context": {
     "key_decisions": [],
     "blockers": [],

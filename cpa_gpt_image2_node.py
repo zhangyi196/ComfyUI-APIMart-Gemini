@@ -109,6 +109,7 @@ class CPAGPTImage2GenerationNode:
                 "callback_url": ("STRING", {"multiline": False, "default": ""}),
                 "upload_url": ("STRING", {"multiline": False, "default": cls.FILE_UPLOAD_URL}),
                 "upload_api_key": ("STRING", {"multiline": False, "default": ""}),
+                "async_api_key": ("STRING", {"multiline": False, "default": ""}),
                 "submit_timeout": ("INT", {"default": 300, "min": 30, "max": 1800}),
                 "image_1": ("IMAGE",),
                 "image_2": ("IMAGE",),
@@ -532,6 +533,7 @@ class CPAGPTImage2GenerationNode:
             callback_url = kwargs.get("callback_url", "").strip()
             upload_url = self.resolve_upload_url(kwargs.get("upload_url", ""))
             upload_api_key = kwargs.get("upload_api_key", "").strip() or api_key
+            async_api_key = kwargs.get("async_api_key", "").strip() or api_key
             submit_timeout = int(kwargs.get("submit_timeout", 300))
 
             self.validate_inputs(
@@ -588,8 +590,9 @@ class CPAGPTImage2GenerationNode:
             print(f"[CPAGPTImage2Node] 提交地址: {submit_url}")
             print(f"[CPAGPTImage2Node] 查询地址: {query_url}")
 
+            submit_api_key = async_api_key if async_mode else api_key
             headers = {
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {submit_api_key}",
                 "Content-Type": "application/json",
             }
 
@@ -612,7 +615,7 @@ class CPAGPTImage2GenerationNode:
                 task_id = response_data.get("task_id")
                 if not task_id:
                     raise ValueError(f"异步模式需要 task_id，但响应中未包含: {response_data}")
-                image_url, final_response = self.poll_task_status(task_id, api_key, query_url)
+                image_url, final_response = self.poll_task_status(task_id, async_api_key, query_url)
                 result_image = self.download_image(image_url)
             else:
                 task_id = self.extract_task_id(response_data)

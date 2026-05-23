@@ -71,7 +71,16 @@
       "completed_at": "2026-05-22T17:38:53.066874+08:00"
     }
   ],
-  "last_updated": "2026-05-22T17:38:53.066874+08:00",
+  "quick_tasks": [
+    {
+      "id": "quick-cpa-upload-url-disclosure-2026-05-23",
+      "description": "CPA节点图像上传URL完全披露，移除自动追加后缀",
+      "completed_at": "2026-05-23T14:14:00+08:00",
+      "directory": ".workflow/scratch/quick-cpa-upload-url-disclosure-2026-05-23",
+      "verified": "skipped"
+    }
+  ],
+  "last_updated": "2026-05-23T14:14:00+08:00",
   "accumulated_context": {
     "key_decisions": [],
     "blockers": [],

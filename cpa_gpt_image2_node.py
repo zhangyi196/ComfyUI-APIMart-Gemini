@@ -63,6 +63,23 @@ class CPAGPTImage2GenerationNode:
     FILE_UPLOAD_URL = "https://file.reachapi.ai/file/uploads"
     MODEL_NAME = "gpt-image-2"
     SIZE_PATTERN = re.compile(r"^(\d+)x(\d+)$")
+    STANDARD_SIZE_MAP = {
+        ("1k", "1:1"): "1024x1024",
+        ("1k", "3:2"): "1536x1024",
+        ("1k", "2:3"): "1024x1536",
+        ("1k", "4:3"): "1360x1024",
+        ("1k", "3:4"): "1024x1360",
+        ("1k", "16:9"): "1824x1024",
+        ("1k", "9:16"): "1024x1824",
+        ("2k", "1:1"): "2048x2048",
+        ("2k", "3:2"): "2048x1152",
+        ("2k", "4:3"): "2048x1536",
+        ("2k", "3:4"): "1536x2048",
+        ("4k", "3:2"): "3840x2160",
+        ("4k", "2:3"): "2160x3840",
+        ("4k", "4:3"): "3840x2880",
+        ("4k", "3:4"): "2880x3840",
+    }
 
     def __init__(self):
         self.poll_interval = 4
@@ -78,7 +95,8 @@ class CPAGPTImage2GenerationNode:
                 "base_url": ("STRING", {"multiline": False, "default": cls.DEFAULT_BASE_URL}),
                 "prompt": ("STRING", {"multiline": True}),
                 "model": ([cls.MODEL_NAME], {"default": cls.MODEL_NAME}),
-                "size": (["1024x1024", "1536x1024", "1024x1536", "1360x1024", "1024x1360", "1824x1024", "1024x1824", "2048x2048", "2048x1152", "2048x1536", "1536x2048", "3840x2160", "2160x3840", "3840x2880", "2880x3840"], {"default": "1024x1024"}),
+                "resolution": (["1k", "2k", "4k"], {"default": "1k"}),
+                "aspect_ratio": (["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16"], {"default": "1:1"}),
                 "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
                 "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
                 "moderation": (["auto", "low"], {"default": "auto"}),
@@ -219,6 +237,8 @@ class CPAGPTImage2GenerationNode:
     def validate_inputs(
         self,
         mode: str,
+        resolution: str,
+        aspect_ratio: str,
         custom_size: str,
         reference_images: List[Any],
         background: str,
@@ -243,6 +263,10 @@ class CPAGPTImage2GenerationNode:
         normalized_size = custom_size.strip()
         if normalized_size:
             self.validate_size(normalized_size)
+            return
+
+        if (resolution, aspect_ratio) not in self.STANDARD_SIZE_MAP:
+            raise ValueError("当前 resolution 与 aspect_ratio 组合不在标准映射表中，请改用 custom_size")
 
     def upload_image(self, image_tensor: Any, api_key: str, upload_url: str, index: int) -> str:
         image_bytes = self.tensor_to_png_bytes(image_tensor)
@@ -287,7 +311,8 @@ class CPAGPTImage2GenerationNode:
     def build_input_payload(
         self,
         prompt: str,
-        size: str,
+        resolution: str,
+        aspect_ratio: str,
         quality: str,
         background: str,
         moderation: str,
@@ -307,7 +332,7 @@ class CPAGPTImage2GenerationNode:
         if normalized_size:
             input_payload["size"] = normalized_size
         else:
-            input_payload["size"] = size
+            input_payload["size"] = self.STANDARD_SIZE_MAP[(resolution, aspect_ratio)]
 
         if image_urls:
             input_payload["images"] = [{"image_url": url} for url in image_urls]
@@ -430,7 +455,8 @@ class CPAGPTImage2GenerationNode:
         base_url: str,
         prompt: str,
         model: str,
-        size: str,
+        resolution: str,
+        aspect_ratio: str,
         quality: str,
         background: str,
         moderation: str,
@@ -453,6 +479,8 @@ class CPAGPTImage2GenerationNode:
 
             self.validate_inputs(
                 mode=mode,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
                 custom_size=custom_size,
                 reference_images=reference_images,
                 background=background,
@@ -467,7 +495,8 @@ class CPAGPTImage2GenerationNode:
             )
             input_payload = self.build_input_payload(
                 prompt=prompt,
-                size=size,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
                 quality=quality,
                 background=background,
                 moderation=moderation,

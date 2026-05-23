@@ -26,10 +26,16 @@ class CPAGPTImage2GenerationNode:
         ("1k", "1:1"): "1024x1024",
         ("1k", "3:2"): "1536x1024",
         ("1k", "2:3"): "1024x1536",
+        ("1k", "4:3"): "1360x1024",
+        ("1k", "3:4"): "1024x1360",
         ("2k", "1:1"): "2048x2048",
         ("2k", "3:2"): "2048x1152",
+        ("2k", "4:3"): "2048x1536",
+        ("2k", "3:4"): "1536x2048",
         ("4k", "3:2"): "3840x2160",
         ("4k", "2:3"): "2160x3840",
+        ("4k", "4:3"): "3840x2880",
+        ("4k", "3:4"): "2880x3840",
     }
     SIZE_PATTERN = re.compile(r"^(\d+)x(\d+)$")
 
@@ -48,8 +54,8 @@ class CPAGPTImage2GenerationNode:
                 "prompt": ("STRING", {"multiline": True}),
                 "model": ([cls.MODEL_NAME], {"default": cls.MODEL_NAME}),
                 "resolution": (["1k", "2k", "4k"], {"default": "1k"}),
-                "aspect_ratio": (["1:1", "3:2", "2:3"], {"default": "1:1"}),
-                "quality": (["low", "medium", "high"], {"default": "medium"}),
+                "aspect_ratio": (["1:1", "3:2", "2:3", "4:3", "3:4"], {"default": "1:1"}),
+                "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
                 "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
                 "moderation": (["auto", "low"], {"default": "auto"}),
                 "output_format": (["png", "jpeg", "webp"], {"default": "png"}),

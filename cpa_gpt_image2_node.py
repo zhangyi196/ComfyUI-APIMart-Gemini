@@ -57,7 +57,7 @@ class CPAGPTImage2GenerationNode:
             "optional": {
                 "custom_size": ("STRING", {"multiline": False, "default": ""}),
                 "callback_url": ("STRING", {"multiline": False, "default": ""}),
-                "upload_url": ("STRING", {"multiline": False, "default": ""}),
+                "upload_url": ("STRING", {"multiline": False, "default": cls.FILE_UPLOAD_URL}),
                 "upload_api_key": ("STRING", {"multiline": False, "default": ""}),
                 "submit_timeout": ("INT", {"default": 300, "min": 30, "max": 1800}),
                 "image_1": ("IMAGE",),
@@ -113,11 +113,7 @@ class CPAGPTImage2GenerationNode:
         if "://" not in normalized:
             normalized = f"https://{normalized.lstrip('/')}"
 
-        parts = urlsplit(normalized)
-        path = parts.path.rstrip("/")
-        if not path:
-            path = "/file/uploads"
-        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+        return normalized
 
     def tensor_to_png_bytes(self, tensor: Any) -> bytes:
         if torch is not None and isinstance(tensor, torch.Tensor):

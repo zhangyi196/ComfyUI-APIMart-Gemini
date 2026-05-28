@@ -63,6 +63,8 @@ class CPAGPTImage2GenerationNode:
     FILE_UPLOAD_URL = "https://file.reachapi.ai/file/uploads"
     MODEL_NAME = "gpt-image-2"
     SIZE_PATTERN = re.compile(r"^(\d+)x(\d+)$")
+    RETRYABLE_SUBMIT_STATUS_CODES = {502, 503, 504}
+    SUBMIT_RETRY_DELAYS = (2, 4)
     STANDARD_SIZE_MAP = {
         ("1k", "1:1"): "1024x1024",
         ("1k", "3:2"): "1536x1024",
@@ -101,6 +103,7 @@ class CPAGPTImage2GenerationNode:
                 "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
                 "moderation": (["auto", "low"], {"default": "auto"}),
                 "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": {
                 "custom_size": ("STRING", {"multiline": False, "default": ""}),
@@ -339,6 +342,44 @@ class CPAGPTImage2GenerationNode:
 
         return input_payload
 
+    def submit_with_retry(
+        self,
+        submit_url: str,
+        payload: Dict[str, Any],
+        headers: Dict[str, str],
+        submit_timeout: int,
+    ) -> requests.Response:
+        max_attempts = len(self.SUBMIT_RETRY_DELAYS) + 1
+        last_response: Optional[requests.Response] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(submit_url, json=payload, headers=headers, timeout=(10, submit_timeout))
+            except requests.exceptions.ReadTimeout as exc:
+                raise RuntimeError(f"提交请求超时：{submit_timeout} 秒内未收到网关响应") from exc
+
+            last_response = response
+            if response.status_code not in self.RETRYABLE_SUBMIT_STATUS_CODES:
+                return response
+
+            print(
+                f"[CPAGPTImage2Node] 提交返回 HTTP {response.status_code}，"
+                f"第 {attempt}/{max_attempts} 次尝试"
+            )
+            print(f"[CPAGPTImage2Node] 提交失败响应: {response.text[:2000]}")
+
+            if attempt >= max_attempts:
+                return response
+
+            wait_seconds = self.SUBMIT_RETRY_DELAYS[attempt - 1]
+            response.close()
+            print(f"[CPAGPTImage2Node] {wait_seconds} 秒后重试提交")
+            time.sleep(wait_seconds)
+
+        if last_response is None:
+            raise RuntimeError("提交请求失败：未收到任何响应")
+        return last_response
+
     def extract_task_id(self, response_data: Dict[str, Any]) -> Optional[str]:
         task_id = response_data.get("task_id")
         if isinstance(task_id, str) and task_id:
@@ -461,6 +502,7 @@ class CPAGPTImage2GenerationNode:
         background: str,
         moderation: str,
         output_format: str,
+        seed: int,
         **kwargs: Any,
     ) -> Tuple[Any, str, str]:
         try:
@@ -509,6 +551,8 @@ class CPAGPTImage2GenerationNode:
                 "model": model,
                 **input_payload,
             }
+            if seed > 0:
+                payload["seed"] = seed
             if callback_url:
                 payload["callback_url"] = callback_url
 
@@ -517,10 +561,12 @@ class CPAGPTImage2GenerationNode:
                 "Content-Type": "application/json",
             }
 
-            try:
-                response = requests.post(submit_url, json=payload, headers=headers, timeout=(10, submit_timeout))
-            except requests.exceptions.ReadTimeout as exc:
-                raise RuntimeError(f"提交请求超时：{submit_timeout} 秒内未收到网关响应") from exc
+            response = self.submit_with_retry(
+                submit_url=submit_url,
+                payload=payload,
+                headers=headers,
+                submit_timeout=submit_timeout,
+            )
 
             try:
                 response.raise_for_status()
@@ -546,6 +592,7 @@ class CPAGPTImage2GenerationNode:
                     "submit_url": submit_url,
                     "query_url": query_url,
                     "upload_url": upload_url,
+                    "request_seed": seed,
                     "submit_response": sanitized_response_data,
                     "query_response": self.sanitize_response_data(final_response),
                     "uploaded_image_urls": image_urls,

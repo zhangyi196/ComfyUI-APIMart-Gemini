@@ -1,8 +1,8 @@
+import base64
 import io
 import json
 import re
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import requests
@@ -14,13 +14,10 @@ except ImportError:
     torch = None
 
 
-class ReachGPTImage2GenerationNode:
-    """ComfyUI node for ReachAPI GPT Image 2 async generation."""
-
-    API_URL = "https://api.reachapi.ai/v1/images/create"
-    QUERY_URL = "https://api.reachapi.ai/v1/tasks"
-    FILE_UPLOAD_URL = "https://file.reachapi.ai/file/uploads"
-    MODEL_NAME = "gpt-image-2-async"
+class ReachGPTImage2SyncGenerationNode:
+    GENERATIONS_URL = "https://api.reachapi.ai/v1/images/generations"
+    EDITS_URL = "https://api.reachapi.ai/v1/images/edits"
+    MODEL_NAME = "gpt-image-2"
     SIZE_PATTERN = re.compile(r"^(\d+)x(\d+)$")
     STANDARD_SIZE_MAP = {
         ("1k", "1:1"): "1024x1024",
@@ -40,10 +37,20 @@ class ReachGPTImage2GenerationNode:
         ("4k", "3:4"): "2880x3840",
     }
 
-    def __init__(self):
-        self.poll_interval = 4
-        self.max_polls = 90
-        self.first_poll_delay = 4
+    def get_direct_session(self) -> requests.Session:
+        if not hasattr(self, "_direct_session"):
+            session = requests.Session()
+            session.trust_env = False
+            self._direct_session = session
+        return self._direct_session
+
+    def request_with_proxy_fallback(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        try:
+            return requests.request(method, url, **kwargs)
+        except requests.exceptions.ProxyError as exc:
+            print(f"[ReachGPTImage2SyncNode] 系统代理请求失败，改为直连重试: {exc}")
+            session = self.get_direct_session()
+            return session.request(method, url, **kwargs)
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
@@ -63,7 +70,6 @@ class ReachGPTImage2GenerationNode:
             },
             "optional": {
                 "custom_size": ("STRING", {"multiline": False, "default": ""}),
-                "callback_url": ("STRING", {"multiline": False, "default": ""}),
                 "image_1": ("IMAGE",),
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
@@ -166,7 +172,6 @@ class ReachGPTImage2GenerationNode:
         reference_images: List[Any],
         background: str,
         output_format: str,
-        callback_url: str,
     ) -> None:
         if mode == "image-to-image" and not reference_images:
             raise ValueError("图像编辑模式至少需要 1 张参考图")
@@ -180,9 +185,6 @@ class ReachGPTImage2GenerationNode:
         if background == "transparent" and output_format == "jpeg":
             raise ValueError("background=transparent 不支持 output_format=jpeg")
 
-        if callback_url and not callback_url.startswith("https://"):
-            raise ValueError("callback_url 仅支持 https 地址")
-
         normalized_size = custom_size.strip()
         if normalized_size:
             self.validate_size(normalized_size)
@@ -191,140 +193,116 @@ class ReachGPTImage2GenerationNode:
         if (resolution, aspect_ratio) not in self.STANDARD_SIZE_MAP:
             raise ValueError("当前 resolution 与 aspect_ratio 组合不在标准映射表中，请改用 custom_size")
 
-    def upload_image(self, image_tensor: Any, api_key: str, index: int) -> str:
-        image_bytes = self.tensor_to_png_bytes(image_tensor)
-        headers = {"Authorization": f"Bearer {api_key}"}
-        files = {
-            "file": (f"reach_gpt_image2_{index}.png", image_bytes, "image/png"),
-        }
+    def build_size_value(self, resolution: str, aspect_ratio: str, custom_size: str) -> str:
+        normalized_size = custom_size.strip()
+        if normalized_size:
+            return normalized_size
+        return self.STANDARD_SIZE_MAP[(resolution, aspect_ratio)]
 
-        print(f"[ReachGPTImage2Node] 上传参考图 {index}: {self.FILE_UPLOAD_URL}")
-        response = requests.post(self.FILE_UPLOAD_URL, headers=headers, files=files, timeout=60)
-        response.raise_for_status()
-        response_data = response.json()
-        print(f"[ReachGPTImage2Node] 上传响应 {index}: {json.dumps(response_data, ensure_ascii=False)}")
-
-        if response_data.get("code") != 200:
-            raise ValueError(f"参考图上传失败: {response_data}")
-
-        data = response_data.get("data", {})
-        image_url = data.get("url")
-        if not image_url:
-            raise ValueError(f"上传响应缺少 url: {response_data}")
-        if not image_url.startswith("https://"):
-            raise ValueError(f"上传后返回的 url 不是 https 地址: {image_url}")
-        return image_url
-
-    def upload_reference_images(self, reference_images: List[Any], api_key: str) -> List[str]:
-        image_urls = []
-        for index, image_tensor in enumerate(reference_images, start=1):
-            image_urls.append(self.upload_image(image_tensor, api_key, index))
-        return image_urls
-
-    def build_input_payload(
+    def build_generation_payload(
         self,
         prompt: str,
-        resolution: str,
-        aspect_ratio: str,
+        model: str,
+        size: str,
         quality: str,
         background: str,
         moderation: str,
         output_format: str,
-        custom_size: str,
-        image_urls: List[str],
         seed: int,
     ) -> Dict[str, Any]:
-        input_payload: Dict[str, Any] = {
+        payload = {
+            "model": model,
             "prompt": prompt,
+            "size": size,
             "quality": quality,
             "background": background,
             "moderation": moderation,
             "output_format": output_format,
         }
-
-        normalized_size = custom_size.strip()
-        if normalized_size:
-            input_payload["size"] = normalized_size
-        else:
-            input_payload["size"] = self.STANDARD_SIZE_MAP[(resolution, aspect_ratio)]
-
-        if image_urls:
-            input_payload["image_urls"] = image_urls
-
         if seed > 0:
-            input_payload["seed"] = seed
+            payload["seed"] = seed
+        return payload
 
-        return input_payload
+    def build_edit_form_data(
+        self,
+        prompt: str,
+        model: str,
+        size: str,
+        quality: str,
+        background: str,
+        moderation: str,
+        output_format: str,
+        reference_images: List[Any],
+        seed: int,
+    ) -> Tuple[Dict[str, str], List[Tuple[str, Tuple[str, bytes, str]]]]:
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "size": size,
+            "quality": quality,
+            "background": background,
+            "moderation": moderation,
+            "output_format": output_format,
+        }
+        if seed > 0:
+            data["seed"] = str(seed)
+        files: List[Tuple[str, Tuple[str, bytes, str]]] = []
+        for index, image_tensor in enumerate(reference_images, start=1):
+            files.append(
+                (
+                    "image",
+                    (f"reach_gpt_image2_sync_{index}.png", self.tensor_to_png_bytes(image_tensor), "image/png"),
+                )
+            )
+        return data, files
 
-    def extract_task_id(self, response_data: Dict[str, Any]) -> str:
-        if response_data.get("code") != 200:
-            raise ValueError(f"接口返回异常: {response_data}")
+    def sanitize_response_data(self, response_data: Dict[str, Any]) -> Dict[str, Any]:
+        def sanitize_value(value: Any) -> Any:
+            if isinstance(value, dict):
+                sanitized: Dict[str, Any] = {}
+                for key, item in value.items():
+                    if key == "b64_json" and isinstance(item, str):
+                        sanitized[key] = f"<omitted {len(item)} chars>"
+                    else:
+                        sanitized[key] = sanitize_value(item)
+                return sanitized
+            if isinstance(value, list):
+                return [sanitize_value(item) for item in value]
+            return value
 
-        task_id = response_data.get("task_id")
-        if not task_id:
-            raise ValueError(f"响应中缺少 task_id: {response_data}")
-        return task_id
-
-    def extract_image_url(self, response_data: Dict[str, Any]) -> str:
-        status = response_data.get("status")
-        if status != "success":
-            raise ValueError(f"任务未成功，当前状态: {status}")
-
-        data = response_data.get("data")
-        if not isinstance(data, list) or not data:
-            raise ValueError(f"任务已成功，但未返回图片数据: {response_data}")
-
-        first_image = data[0]
-        image_url = first_image.get("url")
-        if not image_url:
-            raise ValueError(f"无法解析返回图片地址: {first_image}")
-        return image_url
-
-    def poll_task_status(self, task_id: str, api_key: str) -> Tuple[str, Dict[str, Any]]:
-        print(f"[ReachGPTImage2Node] 开始轮询任务状态: {task_id}")
-        headers = {"Authorization": f"Bearer {api_key}"}
-
-        time.sleep(self.first_poll_delay)
-
-        for poll_count in range(1, self.max_polls + 1):
-            try:
-                response = requests.get(f"{self.QUERY_URL}/{task_id}", headers=headers, timeout=15)
-                response.raise_for_status()
-                response_data = response.json()
-                print(f"[ReachGPTImage2Node] 轮询 {poll_count}/{self.max_polls}: {json.dumps(response_data, ensure_ascii=False)}")
-
-                status = response_data.get("status")
-                if status == "success":
-                    return self.extract_image_url(response_data), response_data
-
-                if status == "failed":
-                    raise ValueError(f"任务失败: {response_data.get('msg') or response_data}")
-
-                if status in {"queued", "generating"}:
-                    time.sleep(self.poll_interval)
-                    continue
-
-                if response_data.get("code") != 200:
-                    raise ValueError(f"任务查询失败: {response_data}")
-
-                print(f"[ReachGPTImage2Node] 遇到未识别状态 {status}，继续轮询")
-                time.sleep(self.poll_interval)
-            except requests.exceptions.RequestException as exc:
-                print(f"[ReachGPTImage2Node] 查询任务失败: {exc}")
-                if poll_count == self.max_polls:
-                    raise RuntimeError(f"轮询任务状态失败: {exc}") from exc
-                time.sleep(self.poll_interval)
-
-        raise TimeoutError(f"任务在 {self.first_poll_delay + self.max_polls * self.poll_interval} 秒内未完成")
+        return sanitize_value(response_data)
 
     def download_image(self, image_url: str) -> Image.Image:
-        print(f"[ReachGPTImage2Node] 下载结果图片: {image_url}")
+        print(f"[ReachGPTImage2SyncNode] 下载结果图片: {image_url}")
         try:
-            response = requests.get(image_url, timeout=30)
+            response = self.request_with_proxy_fallback("GET", image_url, timeout=30)
             response.raise_for_status()
             return Image.open(io.BytesIO(response.content))
         except Exception as exc:
             raise RuntimeError(f"下载结果图片失败: {exc}") from exc
+
+    def extract_sync_result(self, response_data: Dict[str, Any]) -> Tuple[Image.Image, str]:
+        data = response_data.get("data")
+        if not isinstance(data, list) or not data:
+            raise ValueError(f"接口返回异常: {response_data}")
+
+        first_image = data[0]
+        if not isinstance(first_image, dict):
+            raise ValueError(f"接口返回异常: {response_data}")
+
+        image_url = first_image.get("url", "")
+        b64_json = first_image.get("b64_json")
+        if isinstance(b64_json, str) and b64_json:
+            try:
+                image_bytes = base64.b64decode(b64_json)
+                return Image.open(io.BytesIO(image_bytes)), image_url
+            except Exception as exc:
+                raise RuntimeError(f"解析 b64_json 失败: {exc}") from exc
+
+        if image_url:
+            return self.download_image(image_url), image_url
+
+        raise ValueError(f"接口未返回可用图片数据: {first_image}")
 
     def generate(
         self,
@@ -342,10 +320,9 @@ class ReachGPTImage2GenerationNode:
         **kwargs: Any,
     ) -> Tuple[Any, str, str]:
         try:
-            print(f"[ReachGPTImage2Node] 开始生成，模式: {mode}")
+            print(f"[ReachGPTImage2SyncNode] 开始生成，模式: {mode}")
             reference_images = self.collect_images(**kwargs)
             custom_size = kwargs.get("custom_size", "")
-            callback_url = kwargs.get("callback_url", "").strip()
 
             self.validate_inputs(
                 mode=mode,
@@ -355,68 +332,87 @@ class ReachGPTImage2GenerationNode:
                 reference_images=reference_images,
                 background=background,
                 output_format=output_format,
-                callback_url=callback_url,
             )
 
-            image_urls = self.upload_reference_images(reference_images, api_key) if reference_images else []
-            input_payload = self.build_input_payload(
-                prompt=prompt,
-                resolution=resolution,
-                aspect_ratio=aspect_ratio,
-                quality=quality,
-                background=background,
-                moderation=moderation,
-                output_format=output_format,
-                custom_size=custom_size,
-                image_urls=image_urls,
-                seed=seed,
-            )
+            size = self.build_size_value(resolution, aspect_ratio, custom_size)
+            headers = {"Authorization": f"Bearer {api_key}"}
 
-            payload: Dict[str, Any] = {
-                "model": model,
-                "input": input_payload,
-            }
-            if callback_url:
-                payload["callback_url"] = callback_url
+            if mode == "image-to-image":
+                submit_url = self.EDITS_URL
+                data, files = self.build_edit_form_data(
+                    prompt=prompt,
+                    model=model,
+                    size=size,
+                    quality=quality,
+                    background=background,
+                    moderation=moderation,
+                    output_format=output_format,
+                    reference_images=reference_images,
+                    seed=seed,
+                )
+                response = self.request_with_proxy_fallback(
+                    "POST",
+                    submit_url,
+                    data=data,
+                    files=files,
+                    headers=headers,
+                    timeout=360,
+                )
+            else:
+                submit_url = self.GENERATIONS_URL
+                payload = self.build_generation_payload(
+                    prompt=prompt,
+                    model=model,
+                    size=size,
+                    quality=quality,
+                    background=background,
+                    moderation=moderation,
+                    output_format=output_format,
+                    seed=seed,
+                )
+                response = self.request_with_proxy_fallback(
+                    "POST",
+                    submit_url,
+                    json=payload,
+                    headers={**headers, "Content-Type": "application/json"},
+                    timeout=360,
+                )
 
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-
-            print(f"[ReachGPTImage2Node] 提交请求: {self.API_URL}")
-            response = requests.post(self.API_URL, json=payload, headers=headers, timeout=60)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                print(f"[ReachGPTImage2SyncNode] 提交失败响应: {response.text[:2000]}")
+                raise RuntimeError(f"HTTP {response.status_code} {response.text[:2000]}") from exc
 
             response_data = response.json()
-            print(f"[ReachGPTImage2Node] 提交响应: {json.dumps(response_data, ensure_ascii=False)}")
+            sanitized_response_data = self.sanitize_response_data(response_data)
+            print(f"[ReachGPTImage2SyncNode] 提交响应: {json.dumps(sanitized_response_data, ensure_ascii=False)}")
 
-            task_id = self.extract_task_id(response_data)
-            image_url, final_response = self.poll_task_status(task_id, api_key)
-            result_image = self.download_image(image_url)
+            result_image, image_url = self.extract_sync_result(response_data)
             result_tensor = self.pil_to_tensor(result_image)
             response_text = json.dumps(
                 {
+                    "submit_url": submit_url,
+                    "mode": mode,
                     "request_seed": seed,
-                    "submit_response": response_data,
-                    "query_response": final_response,
-                    "uploaded_image_urls": image_urls,
+                    "reference_image_count": len(reference_images),
+                    "submit_response": sanitized_response_data,
                 },
                 ensure_ascii=False,
                 indent=2,
             )
 
-            print("[ReachGPTImage2Node] 处理完成")
+            print("[ReachGPTImage2SyncNode] 处理完成")
             return result_tensor, image_url, response_text
         except Exception as exc:
-            print(f"[ReachGPTImage2Node] 执行失败: {exc}")
-            raise Exception(f"ReachGPTImage2Node 执行失败: {exc}") from exc
+            print(f"[ReachGPTImage2SyncNode] 执行失败: {exc}")
+            raise Exception(f"ReachGPTImage2SyncNode 执行失败: {exc}") from exc
 
 
 NODE_CLASS_MAPPINGS = {
-    "ReachGPTImage2GenerationNode": ReachGPTImage2GenerationNode,
+    "ReachGPTImage2SyncGenerationNode": ReachGPTImage2SyncGenerationNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ReachGPTImage2GenerationNode": "reach gpt image2",
+    "ReachGPTImage2SyncGenerationNode": "reach gpt image2 sync",
 }

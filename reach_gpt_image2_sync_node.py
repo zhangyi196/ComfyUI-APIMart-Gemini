@@ -1,8 +1,11 @@
 import base64
+import concurrent.futures
 import io
 import json
 import re
-from typing import Any, Dict, List, Tuple
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -12,6 +15,11 @@ try:
     import torch
 except ImportError:
     torch = None
+
+try:
+    import comfy.model_management as comfy_model_management
+except ImportError:
+    comfy_model_management = None
 
 
 class ReachGPTImage2SyncGenerationNode:
@@ -23,8 +31,8 @@ class ReachGPTImage2SyncGenerationNode:
         ("1k", "1:1"): "1024x1024",
         ("1k", "3:2"): "1536x1024",
         ("1k", "2:3"): "1024x1536",
-        ("1k", "4:3"): "1536x1152",
-        ("1k", "3:4"): "1152x1536",
+        ("1k", "4:3"): "1360x1024",
+        ("1k", "3:4"): "1024x1360",
         ("1k", "16:9"): "1824x1024",
         ("1k", "9:16"): "1024x1824",
         ("2k", "1:1"): "2048x2048",
@@ -37,20 +45,97 @@ class ReachGPTImage2SyncGenerationNode:
         ("4k", "3:4"): "2880x3840",
     }
 
+    def __init__(self):
+        self._session_lock = threading.Lock()
+        self._active_sessions: List[requests.Session] = []
+
+    def open_http_session(self, *, trust_env: bool = True) -> requests.Session:
+        session = requests.Session()
+        session.trust_env = trust_env
+        with self._session_lock:
+            self._active_sessions.append(session)
+        return session
+
+    def close_http_sessions(self) -> None:
+        with self._session_lock:
+            sessions = self._active_sessions
+            self._active_sessions = []
+            if hasattr(self, "_direct_session"):
+                delattr(self, "_direct_session")
+        for session in sessions:
+            session.close()
+
     def get_direct_session(self) -> requests.Session:
         if not hasattr(self, "_direct_session"):
-            session = requests.Session()
-            session.trust_env = False
-            self._direct_session = session
+            self._direct_session = self.open_http_session(trust_env=False)
         return self._direct_session
 
-    def request_with_proxy_fallback(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+    def is_comfy_interrupt(self, exc: BaseException) -> bool:
+        return exc.__class__.__name__ == "InterruptProcessingException"
+
+    def check_interrupted(self) -> None:
+        if comfy_model_management is None:
+            return
         try:
-            return requests.request(method, url, **kwargs)
+            comfy_model_management.throw_exception_if_processing_interrupted()
+        except Exception as exc:
+            if self.is_comfy_interrupt(exc):
+                print("[ReachGPTImage2SyncNode] 检测到 ComfyUI 关闭任务，正在断开当前 HTTP 连接")
+                self.close_http_sessions()
+            raise
+
+    def request_with_interrupt(
+        self,
+        session: requests.Session,
+        method: str,
+        url: str,
+        total_timeout: float,
+        **kwargs: Any,
+    ) -> requests.Response:
+        deadline = time.monotonic() + total_timeout
+        timeout = kwargs.pop("timeout", (10, total_timeout))
+        if isinstance(timeout, tuple):
+            connect_timeout, read_timeout = timeout
+            timeout = (connect_timeout, min(read_timeout, total_timeout))
+        else:
+            timeout = min(float(timeout), total_timeout)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(session.request, method, url, timeout=timeout, **kwargs)
+            while True:
+                try:
+                    self.check_interrupted()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        future.cancel()
+                        raise requests.exceptions.ReadTimeout(f"请求超时：{total_timeout:g} 秒内未收到响应")
+                    try:
+                        return future.result(timeout=min(0.2, remaining))
+                    except concurrent.futures.TimeoutError:
+                        continue
+                except BaseException as exc:
+                    if self.is_comfy_interrupt(exc):
+                        self.close_http_sessions()
+                    future.cancel()
+                    raise
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def request_with_proxy_fallback(
+        self,
+        session: requests.Session,
+        method: str,
+        url: str,
+        total_timeout: float,
+        **kwargs: Any,
+    ) -> requests.Response:
+        try:
+            return self.request_with_interrupt(session, method, url, total_timeout=total_timeout, **kwargs)
         except requests.exceptions.ProxyError as exc:
             print(f"[ReachGPTImage2SyncNode] 系统代理请求失败，改为直连重试: {exc}")
             session = self.get_direct_session()
-            return session.request(method, url, **kwargs)
+            return self.request_with_interrupt(session, method, url, total_timeout=total_timeout, **kwargs)
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
@@ -272,16 +357,23 @@ class ReachGPTImage2SyncGenerationNode:
 
         return sanitize_value(response_data)
 
-    def download_image(self, image_url: str) -> Image.Image:
+    def download_image(self, session: requests.Session, image_url: str) -> Image.Image:
         print(f"[ReachGPTImage2SyncNode] 下载结果图片: {image_url}")
         try:
-            response = self.request_with_proxy_fallback("GET", image_url, timeout=30)
+            response = self.request_with_proxy_fallback(session, "GET", image_url, total_timeout=30)
             response.raise_for_status()
-            return Image.open(io.BytesIO(response.content))
+            try:
+                return Image.open(io.BytesIO(response.content))
+            finally:
+                response.close()
         except Exception as exc:
             raise RuntimeError(f"下载结果图片失败: {exc}") from exc
 
-    def extract_sync_result(self, response_data: Dict[str, Any]) -> Tuple[Image.Image, str]:
+    def extract_sync_result(
+        self,
+        session: requests.Session,
+        response_data: Dict[str, Any],
+    ) -> Tuple[Image.Image, str]:
         data = response_data.get("data")
         if not isinstance(data, list) or not data:
             raise ValueError(f"接口返回异常: {response_data}")
@@ -300,7 +392,7 @@ class ReachGPTImage2SyncGenerationNode:
                 raise RuntimeError(f"解析 b64_json 失败: {exc}") from exc
 
         if image_url:
-            return self.download_image(image_url), image_url
+            return self.download_image(session, image_url), image_url
 
         raise ValueError(f"接口未返回可用图片数据: {first_image}")
 
@@ -319,7 +411,9 @@ class ReachGPTImage2SyncGenerationNode:
         seed: int,
         **kwargs: Any,
     ) -> Tuple[Any, str, str]:
+        session = self.open_http_session()
         try:
+            self.check_interrupted()
             print(f"[ReachGPTImage2SyncNode] 开始生成，模式: {mode}")
             reference_images = self.collect_images(**kwargs)
             custom_size = kwargs.get("custom_size", "")
@@ -351,12 +445,13 @@ class ReachGPTImage2SyncGenerationNode:
                     seed=seed,
                 )
                 response = self.request_with_proxy_fallback(
+                    session,
                     "POST",
                     submit_url,
+                    total_timeout=360,
                     data=data,
                     files=files,
                     headers=headers,
-                    timeout=360,
                 )
             else:
                 submit_url = self.GENERATIONS_URL
@@ -371,11 +466,12 @@ class ReachGPTImage2SyncGenerationNode:
                     seed=seed,
                 )
                 response = self.request_with_proxy_fallback(
+                    session,
                     "POST",
                     submit_url,
+                    total_timeout=360,
                     json=payload,
                     headers={**headers, "Content-Type": "application/json"},
-                    timeout=360,
                 )
 
             try:
@@ -384,11 +480,14 @@ class ReachGPTImage2SyncGenerationNode:
                 print(f"[ReachGPTImage2SyncNode] 提交失败响应: {response.text[:2000]}")
                 raise RuntimeError(f"HTTP {response.status_code} {response.text[:2000]}") from exc
 
-            response_data = response.json()
-            sanitized_response_data = self.sanitize_response_data(response_data)
-            print(f"[ReachGPTImage2SyncNode] 提交响应: {json.dumps(sanitized_response_data, ensure_ascii=False)}")
+            try:
+                response_data = response.json()
+                sanitized_response_data = self.sanitize_response_data(response_data)
+                print(f"[ReachGPTImage2SyncNode] 提交响应: {json.dumps(sanitized_response_data, ensure_ascii=False)}")
 
-            result_image, image_url = self.extract_sync_result(response_data)
+                result_image, image_url = self.extract_sync_result(session, response_data)
+            finally:
+                response.close()
             result_tensor = self.pil_to_tensor(result_image)
             response_text = json.dumps(
                 {
@@ -405,8 +504,12 @@ class ReachGPTImage2SyncGenerationNode:
             print("[ReachGPTImage2SyncNode] 处理完成")
             return result_tensor, image_url, response_text
         except Exception as exc:
+            if self.is_comfy_interrupt(exc):
+                raise
             print(f"[ReachGPTImage2SyncNode] 执行失败: {exc}")
             raise Exception(f"ReachGPTImage2SyncNode 执行失败: {exc}") from exc
+        finally:
+            self.close_http_sessions()
 
 
 NODE_CLASS_MAPPINGS = {

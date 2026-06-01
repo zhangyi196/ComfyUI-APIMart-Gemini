@@ -1,6 +1,8 @@
+import concurrent.futures
 import io
 import json
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +14,11 @@ try:
     import torch
 except ImportError:
     torch = None
+
+try:
+    import comfy.model_management as comfy_model_management
+except ImportError:
+    comfy_model_management = None
 
 
 class ReachGPTImage2GenerationNode:
@@ -26,8 +33,8 @@ class ReachGPTImage2GenerationNode:
         ("1k", "1:1"): "1024x1024",
         ("1k", "3:2"): "1536x1024",
         ("1k", "2:3"): "1024x1536",
-        ("1k", "4:3"): "1536x1152",
-        ("1k", "3:4"): "1152x1536",
+        ("1k", "4:3"): "1360x1024",
+        ("1k", "3:4"): "1024x1360",
         ("1k", "16:9"): "1824x1024",
         ("1k", "9:16"): "1024x1824",
         ("2k", "1:1"): "2048x2048",
@@ -44,6 +51,8 @@ class ReachGPTImage2GenerationNode:
         self.poll_interval = 4
         self.max_polls = 90
         self.first_poll_delay = 4
+        self._session_lock = threading.Lock()
+        self._active_session: Optional[requests.Session] = None
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
@@ -85,6 +94,82 @@ class ReachGPTImage2GenerationNode:
     RETURN_NAMES = ("image", "image_url", "response")
     FUNCTION = "generate"
     CATEGORY = "image/generation"
+
+    def open_http_session(self) -> requests.Session:
+        session = requests.Session()
+        with self._session_lock:
+            if self._active_session is not None:
+                self._active_session.close()
+            self._active_session = session
+        return session
+
+    def close_http_session(self) -> None:
+        with self._session_lock:
+            session = self._active_session
+            self._active_session = None
+        if session is not None:
+            session.close()
+
+    def is_comfy_interrupt(self, exc: BaseException) -> bool:
+        return exc.__class__.__name__ == "InterruptProcessingException"
+
+    def check_interrupted(self) -> None:
+        if comfy_model_management is None:
+            return
+        try:
+            comfy_model_management.throw_exception_if_processing_interrupted()
+        except Exception as exc:
+            if self.is_comfy_interrupt(exc):
+                print("[ReachGPTImage2Node] 检测到 ComfyUI 关闭任务，正在断开当前 HTTP 连接")
+                self.close_http_session()
+            raise
+
+    def interruptible_sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while True:
+            self.check_interrupted()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.2))
+
+    def request_with_interrupt(
+        self,
+        session: requests.Session,
+        method: str,
+        url: str,
+        total_timeout: float,
+        **kwargs: Any,
+    ) -> requests.Response:
+        deadline = time.monotonic() + total_timeout
+        timeout = kwargs.pop("timeout", (10, total_timeout))
+        if isinstance(timeout, tuple):
+            connect_timeout, read_timeout = timeout
+            timeout = (connect_timeout, min(read_timeout, total_timeout))
+        else:
+            timeout = min(float(timeout), total_timeout)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(session.request, method, url, timeout=timeout, **kwargs)
+            while True:
+                try:
+                    self.check_interrupted()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        future.cancel()
+                        raise requests.exceptions.ReadTimeout(f"请求超时：{total_timeout:g} 秒内未收到响应")
+                    try:
+                        return future.result(timeout=min(0.2, remaining))
+                    except concurrent.futures.TimeoutError:
+                        continue
+                except BaseException as exc:
+                    if self.is_comfy_interrupt(exc):
+                        self.close_http_session()
+                    future.cancel()
+                    raise
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def tensor_to_png_bytes(self, tensor: Any) -> bytes:
         if torch is not None and isinstance(tensor, torch.Tensor):
@@ -191,7 +276,13 @@ class ReachGPTImage2GenerationNode:
         if (resolution, aspect_ratio) not in self.STANDARD_SIZE_MAP:
             raise ValueError("当前 resolution 与 aspect_ratio 组合不在标准映射表中，请改用 custom_size")
 
-    def upload_image(self, image_tensor: Any, api_key: str, index: int) -> str:
+    def upload_image(
+        self,
+        session: requests.Session,
+        image_tensor: Any,
+        api_key: str,
+        index: int,
+    ) -> str:
         image_bytes = self.tensor_to_png_bytes(image_tensor)
         headers = {"Authorization": f"Bearer {api_key}"}
         files = {
@@ -199,26 +290,42 @@ class ReachGPTImage2GenerationNode:
         }
 
         print(f"[ReachGPTImage2Node] 上传参考图 {index}: {self.FILE_UPLOAD_URL}")
-        response = requests.post(self.FILE_UPLOAD_URL, headers=headers, files=files, timeout=60)
+        self.check_interrupted()
+        response = self.request_with_interrupt(
+            session,
+            "POST",
+            self.FILE_UPLOAD_URL,
+            total_timeout=60,
+            headers=headers,
+            files=files,
+        )
         response.raise_for_status()
-        response_data = response.json()
-        print(f"[ReachGPTImage2Node] 上传响应 {index}: {json.dumps(response_data, ensure_ascii=False)}")
+        try:
+            response_data = response.json()
+            print(f"[ReachGPTImage2Node] 上传响应 {index}: {json.dumps(response_data, ensure_ascii=False)}")
 
-        if response_data.get("code") != 200:
-            raise ValueError(f"参考图上传失败: {response_data}")
+            if response_data.get("code") != 200:
+                raise ValueError(f"参考图上传失败: {response_data}")
 
-        data = response_data.get("data", {})
-        image_url = data.get("url")
-        if not image_url:
-            raise ValueError(f"上传响应缺少 url: {response_data}")
-        if not image_url.startswith("https://"):
-            raise ValueError(f"上传后返回的 url 不是 https 地址: {image_url}")
-        return image_url
+            data = response_data.get("data", {})
+            image_url = data.get("url")
+            if not image_url:
+                raise ValueError(f"上传响应缺少 url: {response_data}")
+            if not image_url.startswith("https://"):
+                raise ValueError(f"上传后返回的 url 不是 https 地址: {image_url}")
+            return image_url
+        finally:
+            response.close()
 
-    def upload_reference_images(self, reference_images: List[Any], api_key: str) -> List[str]:
+    def upload_reference_images(
+        self,
+        session: requests.Session,
+        reference_images: List[Any],
+        api_key: str,
+    ) -> List[str]:
         image_urls = []
         for index, image_tensor in enumerate(reference_images, start=1):
-            image_urls.append(self.upload_image(image_tensor, api_key, index))
+            image_urls.append(self.upload_image(session, image_tensor, api_key, index))
         return image_urls
 
     def build_input_payload(
@@ -280,49 +387,67 @@ class ReachGPTImage2GenerationNode:
             raise ValueError(f"无法解析返回图片地址: {first_image}")
         return image_url
 
-    def poll_task_status(self, task_id: str, api_key: str) -> Tuple[str, Dict[str, Any]]:
+    def poll_task_status(
+        self,
+        session: requests.Session,
+        task_id: str,
+        api_key: str,
+    ) -> Tuple[str, Dict[str, Any]]:
         print(f"[ReachGPTImage2Node] 开始轮询任务状态: {task_id}")
         headers = {"Authorization": f"Bearer {api_key}"}
 
-        time.sleep(self.first_poll_delay)
+        self.interruptible_sleep(self.first_poll_delay)
 
         for poll_count in range(1, self.max_polls + 1):
             try:
-                response = requests.get(f"{self.QUERY_URL}/{task_id}", headers=headers, timeout=15)
+                self.check_interrupted()
+                response = self.request_with_interrupt(
+                    session,
+                    "GET",
+                    f"{self.QUERY_URL}/{task_id}",
+                    total_timeout=15,
+                    headers=headers,
+                )
                 response.raise_for_status()
-                response_data = response.json()
-                print(f"[ReachGPTImage2Node] 轮询 {poll_count}/{self.max_polls}: {json.dumps(response_data, ensure_ascii=False)}")
+                try:
+                    response_data = response.json()
+                    print(f"[ReachGPTImage2Node] 轮询 {poll_count}/{self.max_polls}: {json.dumps(response_data, ensure_ascii=False)}")
 
-                status = response_data.get("status")
-                if status == "success":
-                    return self.extract_image_url(response_data), response_data
+                    status = response_data.get("status")
+                    if status == "success":
+                        return self.extract_image_url(response_data), response_data
 
-                if status == "failed":
-                    raise ValueError(f"任务失败: {response_data.get('msg') or response_data}")
+                    if status == "failed":
+                        raise ValueError(f"任务失败: {response_data.get('msg') or response_data}")
 
-                if status in {"queued", "generating"}:
-                    time.sleep(self.poll_interval)
-                    continue
+                    if status in {"queued", "generating"}:
+                        self.interruptible_sleep(self.poll_interval)
+                        continue
 
-                if response_data.get("code") != 200:
-                    raise ValueError(f"任务查询失败: {response_data}")
+                    if response_data.get("code") != 200:
+                        raise ValueError(f"任务查询失败: {response_data}")
 
-                print(f"[ReachGPTImage2Node] 遇到未识别状态 {status}，继续轮询")
-                time.sleep(self.poll_interval)
+                    print(f"[ReachGPTImage2Node] 遇到未识别状态 {status}，继续轮询")
+                    self.interruptible_sleep(self.poll_interval)
+                finally:
+                    response.close()
             except requests.exceptions.RequestException as exc:
                 print(f"[ReachGPTImage2Node] 查询任务失败: {exc}")
                 if poll_count == self.max_polls:
                     raise RuntimeError(f"轮询任务状态失败: {exc}") from exc
-                time.sleep(self.poll_interval)
+                self.interruptible_sleep(self.poll_interval)
 
         raise TimeoutError(f"任务在 {self.first_poll_delay + self.max_polls * self.poll_interval} 秒内未完成")
 
-    def download_image(self, image_url: str) -> Image.Image:
+    def download_image(self, session: requests.Session, image_url: str) -> Image.Image:
         print(f"[ReachGPTImage2Node] 下载结果图片: {image_url}")
         try:
-            response = requests.get(image_url, timeout=30)
+            response = self.request_with_interrupt(session, "GET", image_url, total_timeout=30)
             response.raise_for_status()
-            return Image.open(io.BytesIO(response.content))
+            try:
+                return Image.open(io.BytesIO(response.content))
+            finally:
+                response.close()
         except Exception as exc:
             raise RuntimeError(f"下载结果图片失败: {exc}") from exc
 
@@ -341,7 +466,9 @@ class ReachGPTImage2GenerationNode:
         seed: int,
         **kwargs: Any,
     ) -> Tuple[Any, str, str]:
+        session = self.open_http_session()
         try:
+            self.check_interrupted()
             print(f"[ReachGPTImage2Node] 开始生成，模式: {mode}")
             reference_images = self.collect_images(**kwargs)
             custom_size = kwargs.get("custom_size", "")
@@ -358,7 +485,7 @@ class ReachGPTImage2GenerationNode:
                 callback_url=callback_url,
             )
 
-            image_urls = self.upload_reference_images(reference_images, api_key) if reference_images else []
+            image_urls = self.upload_reference_images(session, reference_images, api_key) if reference_images else []
             input_payload = self.build_input_payload(
                 prompt=prompt,
                 resolution=resolution,
@@ -385,15 +512,25 @@ class ReachGPTImage2GenerationNode:
             }
 
             print(f"[ReachGPTImage2Node] 提交请求: {self.API_URL}")
-            response = requests.post(self.API_URL, json=payload, headers=headers, timeout=60)
+            response = self.request_with_interrupt(
+                session,
+                "POST",
+                self.API_URL,
+                total_timeout=60,
+                json=payload,
+                headers=headers,
+            )
             response.raise_for_status()
 
-            response_data = response.json()
-            print(f"[ReachGPTImage2Node] 提交响应: {json.dumps(response_data, ensure_ascii=False)}")
+            try:
+                response_data = response.json()
+                print(f"[ReachGPTImage2Node] 提交响应: {json.dumps(response_data, ensure_ascii=False)}")
 
-            task_id = self.extract_task_id(response_data)
-            image_url, final_response = self.poll_task_status(task_id, api_key)
-            result_image = self.download_image(image_url)
+                task_id = self.extract_task_id(response_data)
+                image_url, final_response = self.poll_task_status(session, task_id, api_key)
+                result_image = self.download_image(session, image_url)
+            finally:
+                response.close()
             result_tensor = self.pil_to_tensor(result_image)
             response_text = json.dumps(
                 {
@@ -409,8 +546,12 @@ class ReachGPTImage2GenerationNode:
             print("[ReachGPTImage2Node] 处理完成")
             return result_tensor, image_url, response_text
         except Exception as exc:
+            if self.is_comfy_interrupt(exc):
+                raise
             print(f"[ReachGPTImage2Node] 执行失败: {exc}")
             raise Exception(f"ReachGPTImage2Node 执行失败: {exc}") from exc
+        finally:
+            self.close_http_session()
 
 
 NODE_CLASS_MAPPINGS = {

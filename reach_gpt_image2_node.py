@@ -339,7 +339,6 @@ class ReachGPTImage2GenerationNode:
         output_format: str,
         custom_size: str,
         image_urls: List[str],
-        seed: int,
     ) -> Dict[str, Any]:
         input_payload: Dict[str, Any] = {
             "prompt": prompt,
@@ -357,9 +356,6 @@ class ReachGPTImage2GenerationNode:
 
         if image_urls:
             input_payload["image_urls"] = image_urls
-
-        if seed > 0:
-            input_payload["seed"] = seed
 
         return input_payload
 
@@ -496,7 +492,6 @@ class ReachGPTImage2GenerationNode:
                 output_format=output_format,
                 custom_size=custom_size,
                 image_urls=image_urls,
-                seed=seed,
             )
 
             payload: Dict[str, Any] = {
@@ -520,7 +515,11 @@ class ReachGPTImage2GenerationNode:
                 json=payload,
                 headers=headers,
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                print(f"[ReachGPTImage2Node] 提交失败响应: {response.text[:2000]}")
+                raise RuntimeError(f"HTTP {response.status_code} {response.text[:2000]}") from exc
 
             try:
                 response_data = response.json()

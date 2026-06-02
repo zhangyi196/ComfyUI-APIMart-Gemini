@@ -293,7 +293,6 @@ class ReachGPTImage2SyncGenerationNode:
         background: str,
         moderation: str,
         output_format: str,
-        seed: int,
     ) -> Dict[str, Any]:
         payload = {
             "model": model,
@@ -304,8 +303,6 @@ class ReachGPTImage2SyncGenerationNode:
             "moderation": moderation,
             "output_format": output_format,
         }
-        if seed > 0:
-            payload["seed"] = seed
         return payload
 
     def build_edit_form_data(
@@ -318,7 +315,6 @@ class ReachGPTImage2SyncGenerationNode:
         moderation: str,
         output_format: str,
         reference_images: List[Any],
-        seed: int,
     ) -> Tuple[Dict[str, str], List[Tuple[str, Tuple[str, bytes, str]]]]:
         data = {
             "model": model,
@@ -329,8 +325,6 @@ class ReachGPTImage2SyncGenerationNode:
             "moderation": moderation,
             "output_format": output_format,
         }
-        if seed > 0:
-            data["seed"] = str(seed)
         files: List[Tuple[str, Tuple[str, bytes, str]]] = []
         for index, image_tensor in enumerate(reference_images, start=1):
             files.append(
@@ -442,7 +436,6 @@ class ReachGPTImage2SyncGenerationNode:
                     moderation=moderation,
                     output_format=output_format,
                     reference_images=reference_images,
-                    seed=seed,
                 )
                 response = self.request_with_proxy_fallback(
                     session,
@@ -463,7 +456,6 @@ class ReachGPTImage2SyncGenerationNode:
                     background=background,
                     moderation=moderation,
                     output_format=output_format,
-                    seed=seed,
                 )
                 response = self.request_with_proxy_fallback(
                     session,

@@ -326,9 +326,9 @@ class GeminiImageGenerationNode:
 
 # Node class mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
-    "GeminiImageGenerationNode": GeminiImageGenerationNode,
+    "APIMart_nano": GeminiImageGenerationNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "GeminiImageGenerationNode": "Gemini Image Generation (APImart)",
+    "APIMart_nano": "APIMart_nano",
 }

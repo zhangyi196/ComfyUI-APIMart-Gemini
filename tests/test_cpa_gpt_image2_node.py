@@ -22,6 +22,12 @@ reach_sync_module = importlib.util.module_from_spec(reach_sync_spec)
 assert reach_sync_spec.loader is not None
 reach_sync_spec.loader.exec_module(reach_sync_module)
 
+REACH_NANO_MODULE_PATH = Path(__file__).resolve().parents[1] / "reach_nano_node.py"
+reach_nano_spec = importlib.util.spec_from_file_location("reach_nano_node", REACH_NANO_MODULE_PATH)
+reach_nano_module = importlib.util.module_from_spec(reach_nano_spec)
+assert reach_nano_spec.loader is not None
+reach_nano_spec.loader.exec_module(reach_nano_module)
+
 
 class InterruptProcessingException(Exception):
     pass
@@ -141,6 +147,87 @@ class ReachGPTImage2InterruptTests(unittest.TestCase):
                     moderation="auto",
                     output_format="png",
                     seed=0,
+                )
+
+
+class ReachNanoBananaNodeTests(unittest.TestCase):
+    def test_mapping_uses_reach_nanobanana_display_name(self):
+        self.assertIn("ReachNanoBananaGenerationNode", reach_nano_module.NODE_CLASS_MAPPINGS)
+        self.assertEqual(
+            reach_nano_module.NODE_DISPLAY_NAME_MAPPINGS["ReachNanoBananaGenerationNode"],
+            "reach nanobanana",
+        )
+
+    def test_build_input_payload_uses_documented_nanobanana_shape(self):
+        node = reach_nano_module.ReachNanoBananaGenerationNode()
+
+        payload = node.build_input_payload(
+            prompt="premium product shot",
+            aspect_ratio="4:5",
+            resolution="2k",
+            output_format="png",
+            enable_web_search="true",
+            image_urls=["https://example.com/reference.png"],
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "prompt": "premium product shot",
+                "aspect_ratio": "4:5",
+                "resolution": "2k",
+                "output_format": "png",
+                "enable_web_search": True,
+                "image_urls": ["https://example.com/reference.png"],
+            },
+        )
+
+    def test_validate_inputs_requires_reference_for_image_to_image(self):
+        node = reach_nano_module.ReachNanoBananaGenerationNode()
+
+        with self.assertRaises(ValueError):
+            node.validate_inputs(
+                mode="image-to-image",
+                prompt="edit this",
+                reference_images=[],
+                reference_urls=[],
+                callback_url="",
+            )
+
+    def test_parse_reference_image_urls_rejects_non_https(self):
+        node = reach_nano_module.ReachNanoBananaGenerationNode()
+
+        with self.assertRaises(ValueError):
+            node.parse_reference_image_urls("http://example.com/reference.png")
+
+    def test_check_interrupted_closes_active_session_and_reraises(self):
+        node = reach_nano_module.ReachNanoBananaGenerationNode()
+        session = FakeSession()
+        node._active_session = session
+
+        with mock.patch.object(reach_nano_module, "comfy_model_management", FakeComfyModelManagement()):
+            with self.assertRaises(InterruptProcessingException):
+                node.check_interrupted()
+
+        self.assertTrue(session.closed)
+        self.assertIsNone(node._active_session)
+
+    def test_generate_does_not_wrap_comfy_interrupt(self):
+        node = reach_nano_module.ReachNanoBananaGenerationNode()
+
+        with mock.patch.object(node, "open_http_session", return_value=FakeSession()), \
+            mock.patch.object(node, "close_http_session"), \
+            mock.patch.object(node, "check_interrupted", side_effect=InterruptProcessingException):
+            with self.assertRaises(InterruptProcessingException):
+                node.generate(
+                    mode="text-to-image",
+                    api_key="key",
+                    prompt="prompt",
+                    model="nanobanana-pro",
+                    aspect_ratio="1:1",
+                    resolution="2k",
+                    output_format="png",
+                    enable_web_search="false",
                 )
 
 

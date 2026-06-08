@@ -290,7 +290,6 @@ class ReachNanoBananaGenerationNode:
         resolution: str,
         output_format: str,
         enable_web_search: str,
-        seed: int,
         image_urls: List[str],
     ) -> Dict[str, Any]:
         if isinstance(enable_web_search, bool):
@@ -305,9 +304,6 @@ class ReachNanoBananaGenerationNode:
             "output_format": output_format,
             "enable_web_search": web_search_enabled,
         }
-
-        if seed > 0:
-            input_payload["seed"] = seed
 
         if image_urls:
             input_payload["image_urls"] = image_urls
@@ -441,13 +437,15 @@ class ReachNanoBananaGenerationNode:
                 if reference_images
                 else []
             )
+            if seed > 0:
+                print("[ReachNanoBananaNode] seed is not sent because nanobanana-pro does not support it")
+
             input_payload = self.build_input_payload(
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
                 output_format=output_format,
                 enable_web_search=enable_web_search,
-                seed=seed,
                 image_urls=uploaded_image_urls,
             )
 
@@ -495,6 +493,7 @@ class ReachNanoBananaGenerationNode:
                     "query_url": f"{self.QUERY_URL}/{task_id}",
                     "upload_url": self.FILE_UPLOAD_URL,
                     "request_seed": seed,
+                    "seed_sent": False,
                     "uploaded_image_urls": uploaded_image_urls,
                     "submit_response": submit_response,
                     "query_response": query_response,

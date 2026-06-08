@@ -167,7 +167,6 @@ class ReachNanoBananaNodeTests(unittest.TestCase):
             resolution="2k",
             output_format="png",
             enable_web_search="true",
-            seed=12345,
             image_urls=["https://example.com/reference.png"],
         )
 
@@ -179,7 +178,6 @@ class ReachNanoBananaNodeTests(unittest.TestCase):
                 "resolution": "2k",
                 "output_format": "png",
                 "enable_web_search": True,
-                "seed": 12345,
                 "image_urls": ["https://example.com/reference.png"],
             },
         )

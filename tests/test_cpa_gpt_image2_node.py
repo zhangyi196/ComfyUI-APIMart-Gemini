@@ -167,6 +167,7 @@ class ReachNanoBananaNodeTests(unittest.TestCase):
             resolution="2k",
             output_format="png",
             enable_web_search="true",
+            seed=12345,
             image_urls=["https://example.com/reference.png"],
         )
 
@@ -178,6 +179,7 @@ class ReachNanoBananaNodeTests(unittest.TestCase):
                 "resolution": "2k",
                 "output_format": "png",
                 "enable_web_search": True,
+                "seed": 12345,
                 "image_urls": ["https://example.com/reference.png"],
             },
         )
@@ -190,15 +192,15 @@ class ReachNanoBananaNodeTests(unittest.TestCase):
                 mode="image-to-image",
                 prompt="edit this",
                 reference_images=[],
-                reference_urls=[],
                 callback_url="",
             )
 
-    def test_parse_reference_image_urls_rejects_non_https(self):
+    def test_input_types_excludes_reference_image_urls_and_includes_seed(self):
         node = reach_nano_module.ReachNanoBananaGenerationNode()
+        input_types = node.INPUT_TYPES()
 
-        with self.assertRaises(ValueError):
-            node.parse_reference_image_urls("http://example.com/reference.png")
+        self.assertIn("seed", input_types["required"])
+        self.assertNotIn("reference_image_urls", input_types["optional"])
 
     def test_check_interrupted_closes_active_session_and_reraises(self):
         node = reach_nano_module.ReachNanoBananaGenerationNode()
@@ -228,6 +230,7 @@ class ReachNanoBananaNodeTests(unittest.TestCase):
                     resolution="2k",
                     output_format="png",
                     enable_web_search="false",
+                    seed=0,
                 )
 
 

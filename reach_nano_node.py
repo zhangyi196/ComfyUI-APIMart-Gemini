@@ -49,10 +49,10 @@ class ReachNanoBananaGenerationNode:
                 "resolution": (["1k", "2k", "4k"], {"default": "2k"}),
                 "output_format": (["png", "jpeg"], {"default": "png"}),
                 "enable_web_search": (["false", "true"], {"default": "false"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": {
                 "callback_url": ("STRING", {"multiline": False, "default": ""}),
-                "reference_image_urls": ("STRING", {"multiline": True, "default": ""}),
                 "image_1": ("IMAGE",),
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
@@ -204,37 +204,23 @@ class ReachNanoBananaGenerationNode:
                 images.append(kwargs[key])
         return images
 
-    def parse_reference_image_urls(self, reference_image_urls: str) -> List[str]:
-        urls = []
-        normalized = reference_image_urls.replace(",", "\n")
-        for raw_url in normalized.splitlines():
-            url = raw_url.strip()
-            if not url:
-                continue
-            if not url.startswith("https://"):
-                raise ValueError(f"Reference image URL must start with https://: {url}")
-            urls.append(url)
-        return urls
-
     def validate_inputs(
         self,
         mode: str,
         prompt: str,
         reference_images: List[Any],
-        reference_urls: List[str],
         callback_url: str,
     ) -> None:
         if not prompt.strip():
             raise ValueError("prompt cannot be empty")
 
-        total_references = len(reference_images) + len(reference_urls)
-        if mode == "image-to-image" and total_references == 0:
-            raise ValueError("image-to-image mode requires at least one reference image or URL")
+        if mode == "image-to-image" and not reference_images:
+            raise ValueError("image-to-image mode requires at least one reference image")
 
-        if mode == "text-to-image" and total_references > 0:
-            raise ValueError("text-to-image mode should not include reference images or URLs")
+        if mode == "text-to-image" and reference_images:
+            raise ValueError("text-to-image mode should not include reference images")
 
-        if total_references > 14:
+        if len(reference_images) > 14:
             raise ValueError("nanobanana-pro supports at most 14 reference images")
 
         if callback_url and not callback_url.startswith("https://"):
@@ -304,6 +290,7 @@ class ReachNanoBananaGenerationNode:
         resolution: str,
         output_format: str,
         enable_web_search: str,
+        seed: int,
         image_urls: List[str],
     ) -> Dict[str, Any]:
         if isinstance(enable_web_search, bool):
@@ -318,6 +305,9 @@ class ReachNanoBananaGenerationNode:
             "output_format": output_format,
             "enable_web_search": web_search_enabled,
         }
+
+        if seed > 0:
+            input_payload["seed"] = seed
 
         if image_urls:
             input_payload["image_urls"] = image_urls
@@ -428,6 +418,7 @@ class ReachNanoBananaGenerationNode:
         resolution: str,
         output_format: str,
         enable_web_search: str,
+        seed: int,
         **kwargs: Any,
     ) -> Tuple[Any, str, str]:
         session = self.open_http_session()
@@ -436,14 +427,12 @@ class ReachNanoBananaGenerationNode:
             print(f"[ReachNanoBananaNode] Starting generation, mode: {mode}")
 
             reference_images = self.collect_images(**kwargs)
-            reference_urls = self.parse_reference_image_urls(kwargs.get("reference_image_urls", ""))
             callback_url = kwargs.get("callback_url", "").strip()
 
             self.validate_inputs(
                 mode=mode,
                 prompt=prompt,
                 reference_images=reference_images,
-                reference_urls=reference_urls,
                 callback_url=callback_url,
             )
 
@@ -452,14 +441,14 @@ class ReachNanoBananaGenerationNode:
                 if reference_images
                 else []
             )
-            image_urls = reference_urls + uploaded_image_urls
             input_payload = self.build_input_payload(
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
                 output_format=output_format,
                 enable_web_search=enable_web_search,
-                image_urls=image_urls,
+                seed=seed,
+                image_urls=uploaded_image_urls,
             )
 
             payload: Dict[str, Any] = {
@@ -505,7 +494,7 @@ class ReachNanoBananaGenerationNode:
                     "submit_url": self.API_URL,
                     "query_url": f"{self.QUERY_URL}/{task_id}",
                     "upload_url": self.FILE_UPLOAD_URL,
-                    "reference_image_urls": reference_urls,
+                    "request_seed": seed,
                     "uploaded_image_urls": uploaded_image_urls,
                     "submit_response": submit_response,
                     "query_response": query_response,

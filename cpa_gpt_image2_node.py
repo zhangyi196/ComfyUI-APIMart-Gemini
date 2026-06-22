@@ -23,46 +23,6 @@ except ImportError:
     comfy_model_management = None
 
 
-def _find_first_url(data: Any) -> str:
-    """递归查找 JSON 中第一个 https URL（兜底策略）。"""
-    if isinstance(data, str) and data.startswith("https://"):
-        return data
-    if isinstance(data, dict):
-        for v in data.values():
-            result = _find_first_url(v)
-            if result:
-                return result
-    if isinstance(data, list):
-        for item in data:
-            result = _find_first_url(item)
-            if result:
-                return result
-    return ""
-
-
-def _extract_upload_url(response_data: Dict[str, Any]) -> str:
-    """自适应上传响应解析 — 支持 Reach、APIMart 及未知格式。
-
-    优先级：
-    1. 有 code 字段 → Reach 格式（校验 code=200，提取 data.url）
-    2. 顶层有 url   → APIMart 格式（直接返回）
-    3. 递归查找第一个 https:// 开头的值（兜底）
-    """
-    if "code" in response_data:
-        if response_data.get("code") != 200:
-            raise ValueError(f"参考图上传失败: {response_data}")
-        data = response_data.get("data", {})
-        url = data.get("url")
-        if url:
-            return url
-
-    url = response_data.get("url")
-    if isinstance(url, str) and url:
-        return url
-
-    return _find_first_url(response_data)
-
-
 class CPAGPTImage2GenerationNode:
     """ComfyUI node for CPA GPT Image 2 async generation."""
 
@@ -381,22 +341,26 @@ class CPAGPTImage2GenerationNode:
             files=files,
         )
         try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as exc:
-            if response.status_code == 401:
-                raise RuntimeError(
-                    "参考图上传鉴权失败：当前上传接口需要它自己的 Bearer API key。"
-                    "如果任务提交走的是本地网关，请为 upload_url / upload_api_key 单独配置可用的上传凭证。"
-                ) from exc
-            raise
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                if response.status_code == 401:
+                    raise RuntimeError(
+                        "参考图上传鉴权失败：当前上传接口需要它自己的 Bearer API key。"
+                        "如果任务提交走的是本地网关，请为 upload_url / upload_api_key 单独配置可用的上传凭证。"
+                    ) from exc
+                raise
 
-        try:
             response_data = response.json()
             print(f"[CPAGPTImage2Node] 上传响应 {index}: {json.dumps(response_data, ensure_ascii=False)}")
 
-            image_url = _extract_upload_url(response_data)
-            if not image_url:
-                raise ValueError(f"上传响应无法解析 URL: {response_data}")
+            if response_data.get("code") != 200:
+                raise ValueError(f"参考图上传失败: {response_data}")
+
+            data = response_data.get("data")
+            image_url = data.get("url") if isinstance(data, dict) else None
+            if not isinstance(image_url, str) or not image_url:
+                raise ValueError(f"上传响应缺少 data.url: {response_data}")
             if not image_url.startswith("https://"):
                 raise ValueError(f"上传后返回的 url 不是 https 地址: {image_url}")
             return image_url

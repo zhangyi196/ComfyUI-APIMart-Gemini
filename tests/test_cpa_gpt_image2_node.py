@@ -46,6 +46,67 @@ class FakeSession:
         self.closed = True
 
 
+class FakeResponse:
+    def __init__(self, response_data, status_code=200):
+        self.response_data = response_data
+        self.status_code = status_code
+        self.closed = False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise cpa_module.requests.exceptions.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self.response_data
+
+    def close(self):
+        self.closed = True
+
+
+class CPAGPTImage2UploadTests(unittest.TestCase):
+    def test_upload_image_uses_reach_multipart_contract_and_data_url(self):
+        node = cpa_module.CPAGPTImage2GenerationNode()
+        response = FakeResponse(
+            {
+                "code": 200,
+                "msg": "",
+                "data": {"url": "https://cdn.example.com/reference.png"},
+            }
+        )
+
+        with mock.patch.object(node, "tensor_to_png_bytes", return_value=b"png-bytes"), \
+            mock.patch.object(node, "request_with_interrupt", return_value=response) as request:
+            image_url = node.upload_image(
+                FakeSession(),
+                object(),
+                "reach-key",
+                node.FILE_UPLOAD_URL,
+                1,
+            )
+
+        self.assertEqual(image_url, "https://cdn.example.com/reference.png")
+        request.assert_called_once_with(
+            mock.ANY,
+            "POST",
+            node.FILE_UPLOAD_URL,
+            total_timeout=60,
+            headers={"Authorization": "Bearer reach-key"},
+            files={"file": ("cpa_gpt_image2_1.png", b"png-bytes", "image/png")},
+        )
+        self.assertTrue(response.closed)
+
+    def test_upload_image_rejects_non_reach_response_shape(self):
+        node = cpa_module.CPAGPTImage2GenerationNode()
+        response = FakeResponse({"url": "https://example.com/not-reach.png"})
+
+        with mock.patch.object(node, "tensor_to_png_bytes", return_value=b"png-bytes"), \
+            mock.patch.object(node, "request_with_interrupt", return_value=response):
+            with self.assertRaisesRegex(ValueError, "参考图上传失败"):
+                node.upload_image(FakeSession(), object(), "reach-key", node.FILE_UPLOAD_URL, 1)
+
+        self.assertTrue(response.closed)
+
+
 class CPAGPTImage2InterruptTests(unittest.TestCase):
     def test_check_interrupted_closes_active_session_and_reraises(self):
         node = cpa_module.CPAGPTImage2GenerationNode()

@@ -54,9 +54,16 @@
       "completed_at": "2026-05-23T15:30:00+08:00",
       "directory": ".workflow/scratch/quick-async-mode-switch-2026-05-23",
       "verified": "skipped"
+    },
+    {
+      "id": "cpa-reach-image-upload",
+      "description": "CPA GPT Image 2 节点参考图上传收敛为 ReachAPI 文件上传协议",
+      "completed_at": "2026-06-22T14:52:54+08:00",
+      "directory": ".workflow/scratch/cpa-reach-image-upload",
+      "verified": "passed"
     }
   ],
-  "last_updated": "2026-05-23T16:00:00+08:00",
+  "last_updated": "2026-06-22T14:52:54+08:00",
   "accumulated_context": {
     "key_decisions": [],
     "blockers": [],

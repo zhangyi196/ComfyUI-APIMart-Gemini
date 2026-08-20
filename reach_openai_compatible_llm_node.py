@@ -213,8 +213,20 @@ class ReachOpenAICompatibleLLMNode:
         image.save(buffer, format="PNG")
         return buffer.getvalue()
 
+    def split_image_input(self, image: Any) -> List[Any]:
+        """将 ComfyUI 的 IMAGE batch 拆成独立图片，避免多图只发送 batch 首图。"""
+        shape = getattr(image, "shape", None)
+        if shape is not None and len(shape) == 4 and int(shape[0]) > 1:
+            return [image[index : index + 1] for index in range(int(shape[0]))]
+        return [image]
+
     def collect_images(self, **kwargs: Any) -> List[Any]:
-        return [kwargs[f"image_{index}"] for index in range(1, 11) if kwargs.get(f"image_{index}") is not None]
+        images: List[Any] = []
+        for index in range(1, 11):
+            image = kwargs.get(f"image_{index}")
+            if image is not None:
+                images.extend(self.split_image_input(image))
+        return images
 
     def encode_image_data_url(self, image_tensor: Any) -> str:
         encoded = base64.b64encode(self.tensor_to_png_bytes(image_tensor)).decode("ascii")
@@ -229,16 +241,24 @@ class ReachOpenAICompatibleLLMNode:
         index: int,
         timeout: int,
     ) -> str:
+        image_bytes = self.tensor_to_png_bytes(image_tensor)
+        print(
+            f"[ReachOpenAICompatibleLLMNode] 上传图像 {index}: "
+            f"{len(image_bytes) / 1024 / 1024:.2f} MB",
+            flush=True,
+        )
+        if len(image_bytes) > 50 * 1024 * 1024:
+            raise ValueError(f"第 {index} 张图像超过 Reach 上传限制 50 MB")
         response = self.request_with_interrupt(
             session,
             "POST",
             upload_url,
             total_timeout=timeout,
             headers={"Authorization": f"Bearer {api_key}"},
-            files={"file": (f"reach_openai_llm_{index}.png", self.tensor_to_png_bytes(image_tensor), "image/png")},
+            files={"file": (f"reach_openai_llm_{index}.png", image_bytes, "image/png")},
         )
         try:
-            response.raise_for_status()
+            self.raise_for_status_with_body(response, f"第 {index} 张图像上传")
             response_data = response.json()
             if response_data.get("code") != 200:
                 raise ValueError(f"图像上传失败: {response_data}")
@@ -246,6 +266,7 @@ class ReachOpenAICompatibleLLMNode:
             image_url = data.get("url") if isinstance(data, dict) else None
             if not isinstance(image_url, str) or not image_url.startswith("https://"):
                 raise ValueError(f"图像上传响应缺少有效的 data.url: {response_data}")
+            print(f"[ReachOpenAICompatibleLLMNode] 图像 {index} 上传完成", flush=True)
             return image_url
         finally:
             response.close()
@@ -329,6 +350,7 @@ class ReachOpenAICompatibleLLMNode:
         data_lines: List[str],
         events: List[Dict[str, Any]],
         text_parts: List[str],
+        event_counts: Dict[str, int],
     ) -> Optional[Dict[str, Any]]:
         """解析一个 SSE 事件，并返回事件 JSON。"""
         if not data_lines:
@@ -347,18 +369,34 @@ class ReachOpenAICompatibleLLMNode:
         if event_name == "message" and isinstance(event_data.get("type"), str):
             event_name = event_data["type"]
         event = {"event": event_name, "data": event_data}
-        events.append(event)
-        print(f"[ReachOpenAICompatibleLLMNode] SSE event: {event_name}", flush=True)
+        # 不把每个字符增量的完整 data 写入 ComfyUI 输出，避免 response_json 过大。
+        events.append({"event": event_name})
+        event_counts[event_name] = event_counts.get(event_name, 0) + 1
+        event_count = event_counts[event_name]
+
+        # Reach 会发送大量 output_item/content_part/text.delta 事件。
+        # 仅记录关键阶段和首个文本增量，详细进度由 SSE 心跳每 10 秒汇总输出。
+        major_events = {
+            "response.created",
+            "response.in_progress",
+            "response.completed",
+            "response.failed",
+            "response.error",
+            "error",
+        }
+        is_delta = event_name in {"response.output_text.delta", "response.text.delta"}
+        if event_name in major_events or (is_delta and event_count == 1):
+            print(f"[ReachOpenAICompatibleLLMNode] SSE {event_name}", flush=True)
 
         if event_name in {"response.output_text.delta", "response.text.delta"}:
             delta = event_data.get("delta")
             if isinstance(delta, str):
                 text_parts.append(delta)
-                print(
-                    f"[ReachOpenAICompatibleLLMNode] 已接收文本增量: "
-                    f"{len(delta)} chars（累计 {sum(len(part) for part in text_parts)} chars）",
-                    flush=True,
-                )
+                if event_count == 1:
+                    print(
+                        "[ReachOpenAICompatibleLLMNode] 已开始接收输出文本",
+                        flush=True,
+                    )
         elif event_name in {"response.output_text.done", "response.text.done"}:
             done_text = event_data.get("text")
             if isinstance(done_text, str) and done_text and not text_parts:
@@ -375,6 +413,8 @@ class ReachOpenAICompatibleLLMNode:
         data_lines: List[str] = []
         plain_lines: List[str] = []
         last_data: Dict[str, Any] = {}
+        event_counts: Dict[str, int] = {}
+        completed = False
 
         # 使用较小的 chunk，避免代理将多个 SSE 事件缓冲后才交给 ComfyUI。
         # 在独立线程读取 socket，主线程每秒检查中断并输出等待进度。否则代理长时间
@@ -405,7 +445,7 @@ class ReachOpenAICompatibleLLMNode:
                 if time.monotonic() - last_heartbeat >= 10:
                     print(
                         f"[ReachOpenAICompatibleLLMNode] SSE 仍在处理中，已等待 {elapsed:.0f}s，"
-                        f"已收到 {len(events)} 个事件",
+                        f"已收到 {len(events)} 个事件，文本 {sum(len(part) for part in text_parts)} chars",
                         flush=True,
                     )
                     last_heartbeat = time.monotonic()
@@ -419,11 +459,15 @@ class ReachOpenAICompatibleLLMNode:
                 raw_line = raw_line.decode("utf-8", errors="replace")
             line = raw_line.rstrip("\r") if raw_line is not None else ""
             if not line:
-                event = self._finish_sse_event(current_event, data_lines, events, text_parts)
+                event = self._finish_sse_event(current_event, data_lines, events, text_parts, event_counts)
                 if event is not None and isinstance(event.get("data"), dict):
                     last_data = event["data"]
+                if event is not None and event.get("event") in {"response.completed", "response.failed", "response.error", "error"}:
+                    completed = True
                 current_event = "message"
                 data_lines = []
+                if completed:
+                    break
                 continue
             if line.startswith(":"):
                 continue
@@ -436,7 +480,7 @@ class ReachOpenAICompatibleLLMNode:
                 plain_lines.append(line)
 
         # 允许没有以空行结尾的最后一个事件。
-        event = self._finish_sse_event(current_event, data_lines, events, text_parts)
+        event = self._finish_sse_event(current_event, data_lines, events, text_parts, event_counts)
         if event is not None and isinstance(event.get("data"), dict):
             last_data = event["data"]
 
@@ -468,7 +512,8 @@ class ReachOpenAICompatibleLLMNode:
         if not text:
             raise ValueError(f"Reach SSE 完成但没有可读文本: {result}")
         print(
-            f"[ReachOpenAICompatibleLLMNode] SSE completed，累计文本: {len(text)} chars",
+            f"[ReachOpenAICompatibleLLMNode] SSE completed，累计文本: {len(text)} chars，"
+            f"事件数: {sum(event_counts.values())}",
             flush=True,
         )
         return result
@@ -480,6 +525,19 @@ class ReachOpenAICompatibleLLMNode:
         # 有些中转站不带 Content-Type；真实 requests.Response 提供 iter_lines，
         # 测试/兼容的 JSON 响应通常没有该方法。
         return not content_type and callable(getattr(response, "iter_lines", None))
+
+    def raise_for_status_with_body(self, response: requests.Response, context: str) -> None:
+        """将网关的 JSON/文本错误体带入异常，避免只看到笼统的 HTTP 错误。"""
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            body = getattr(response, "text", "")
+            if not isinstance(body, str) or not body:
+                try:
+                    body = json.dumps(response.json(), ensure_ascii=False)
+                except (ValueError, TypeError):
+                    body = "<empty>"
+            raise RuntimeError(f"Reach {context}失败（HTTP {response.status_code}）: {body[:4000]}") from exc
 
     def extract_task_id(self, response_data: Dict[str, Any]) -> Optional[str]:
         candidates = [
@@ -554,7 +612,7 @@ class ReachOpenAICompatibleLLMNode:
                 headers=headers,
             )
             try:
-                response.raise_for_status()
+                self.raise_for_status_with_body(response, "任务轮询")
                 response_data = response.json()
                 status = self.get_status(response_data)
                 print(
@@ -638,7 +696,7 @@ class ReachOpenAICompatibleLLMNode:
                 stream=api_format == "responses",
             )
             try:
-                response.raise_for_status()
+                self.raise_for_status_with_body(response, f"Responses 请求（图像数={len(images)}）")
                 if api_format == "responses" and self.is_sse_response(response):
                     print("[ReachOpenAICompatibleLLMNode] 已连接 SSE，开始接收 Reach 后台进度", flush=True)
                     final_data = self.read_sse_response(response, total_timeout=timeout)

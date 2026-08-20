@@ -87,6 +87,19 @@ class ReachOpenAICompatibleLLMNodeTests(unittest.TestCase):
         self.assertEqual(payload["input"][0]["content"][1]["type"], "input_image")
         self.assertEqual(payload["instructions"], "system")
 
+    def test_collect_images_splits_comfyui_image_batch(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        batch = __import__("numpy").zeros((3, 2, 2, 3), dtype="float32")
+        images = node.collect_images(image_1=batch)
+        self.assertEqual(len(images), 3)
+        self.assertEqual([image.shape for image in images], [(1, 2, 2, 3)] * 3)
+
+    def test_raise_for_status_with_body_preserves_gateway_error(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        response = FakeResponse({"error": {"message": "too many images"}}, status_code=400)
+        with self.assertRaisesRegex(RuntimeError, "too many images"):
+            node.raise_for_status_with_body(response, "Responses 请求")
+
     def test_generate_reads_responses_sse_and_logs_progress(self):
         node = reach_module.ReachOpenAICompatibleLLMNode()
         response = FakeSSEResponse(

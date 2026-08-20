@@ -22,6 +22,7 @@ class OpenAICompatibleLLMNode:
     MODEL_CHOICES = ["gpt-5.6-sol", "gpt-5.6-luna"]
     THINKING_CHOICES = ["medium", "high", "xhigh"]
     IMAGE_MODE_CHOICES = ["none", "base64", "reach_upload"]
+    API_FORMAT_CHOICES = ["chat_completions", "responses"]
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
@@ -39,6 +40,7 @@ class OpenAICompatibleLLMNode:
             "optional": {
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "max_tokens": ("INT", {"default": 4096, "min": 1, "max": 131072}),
+                "api_format": (cls.API_FORMAT_CHOICES, {"default": "chat_completions"}),
                 "upload_url": ("STRING", {"multiline": False, "default": cls.FILE_UPLOAD_URL}),
                 "upload_api_key": ("STRING", {"multiline": False, "password": True, "default": ""}),
                 "request_timeout": ("INT", {"default": 300, "min": 10, "max": 1800}),
@@ -62,6 +64,12 @@ class OpenAICompatibleLLMNode:
         if normalized.endswith("/chat/completions"):
             return normalized
         return f"{normalized}/chat/completions"
+
+    def build_responses_url(self, base_url: str) -> str:
+        normalized = self.normalize_base_url(base_url)
+        if normalized.endswith("/responses"):
+            return normalized
+        return f"{normalized}/responses"
 
     def resolve_upload_url(self, upload_url: str) -> str:
         normalized = upload_url.strip()
@@ -204,6 +212,39 @@ class OpenAICompatibleLLMNode:
         payload["reasoning_effort"] = thinking_mode
         return payload
 
+    def build_responses_payload(
+        self,
+        model: str,
+        system_prompt: str,
+        prompt: str,
+        thinking_mode: str,
+        image_parts: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        if thinking_mode not in self.THINKING_CHOICES:
+            raise ValueError(f"不支持的 thinking_mode: {thinking_mode}")
+
+        content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        for part in image_parts:
+            if part.get("type") != "image_url":
+                raise ValueError(f"无法将图像内容转换为 Responses 格式: {part}")
+            image_url = part.get("image_url", {}).get("url")
+            if not isinstance(image_url, str) or not image_url:
+                raise ValueError(f"图像内容缺少 URL: {part}")
+            content.append({"type": "input_image", "image_url": image_url})
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "input": [{"role": "user", "content": content}],
+            "reasoning": {"effort": thinking_mode},
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+        if system_prompt.strip():
+            payload["instructions"] = system_prompt
+        return payload
+
     def extract_text(self, response_data: Dict[str, Any]) -> str:
         choices = response_data.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -223,6 +264,30 @@ class OpenAICompatibleLLMNode:
             return message["refusal"]
         raise ValueError(f"API 响应缺少可读文本: {response_data}")
 
+    def extract_responses_text(self, response_data: Dict[str, Any]) -> str:
+        output_text = response_data.get("output_text")
+        if isinstance(output_text, str) and output_text:
+            return output_text
+
+        output = response_data.get("output")
+        if isinstance(output, list):
+            text_parts = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        text_parts.append(part["text"])
+            if text_parts:
+                return "".join(text_parts)
+
+        # Some OpenAI-compatible gateways return Chat Completions-shaped data
+        # even when the Responses endpoint is selected.
+        return self.extract_text(response_data)
+
     def generate(
         self,
         api_key: str,
@@ -240,32 +305,51 @@ class OpenAICompatibleLLMNode:
             raise ValueError("prompt 不能为空")
 
         timeout = int(kwargs.get("request_timeout", 300))
+        api_format = kwargs.get("api_format", "chat_completions")
+        if api_format not in self.API_FORMAT_CHOICES:
+            raise ValueError(f"不支持的 api_format: {api_format}")
         images = self.collect_images(**kwargs)
         upload_url = self.resolve_upload_url(kwargs.get("upload_url", "")) if image_mode == "reach_upload" else ""
         upload_api_key = kwargs.get("upload_api_key", "").strip() or api_key
-        payload = self.build_payload(
-            model=model,
-            system_prompt=system_prompt,
-            prompt=prompt,
-            thinking_mode=thinking_mode,
-            image_parts=self.build_image_parts(
-                image_mode=image_mode,
-                images=images,
-                api_key=upload_api_key,
-                upload_url=upload_url,
-                timeout=timeout,
-            ),
-            temperature=float(kwargs.get("temperature", 1.0)),
-            max_tokens=int(kwargs.get("max_tokens", 4096)),
+        image_parts = self.build_image_parts(
+            image_mode=image_mode,
+            images=images,
+            api_key=upload_api_key,
+            upload_url=upload_url,
+            timeout=timeout,
         )
+        temperature = float(kwargs.get("temperature", 1.0))
+        max_tokens = int(kwargs.get("max_tokens", 4096))
+        if api_format == "responses":
+            request_url = self.build_responses_url(base_url)
+            payload = self.build_responses_payload(
+                model=model,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                thinking_mode=thinking_mode,
+                image_parts=image_parts,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        else:
+            request_url = self.build_chat_url(base_url)
+            payload = self.build_payload(
+                model=model,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                thinking_mode=thinking_mode,
+                image_parts=image_parts,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
         chat_url = self.build_chat_url(base_url)
         print(
-            f"[OpenAICompatibleLLMNode] 请求模型: {model}，思考模式: {thinking_mode}，"
+            f"[OpenAICompatibleLLMNode] API 格式: {api_format}，请求模型: {model}，思考模式: {thinking_mode}，"
             f"图像模式: {image_mode}，图像数量: {len(images) if image_mode != 'none' else 0}"
         )
         response = requests.post(
-            chat_url,
+            request_url,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload,
             timeout=timeout,
@@ -277,7 +361,7 @@ class OpenAICompatibleLLMNode:
         finally:
             response.close()
 
-        text = self.extract_text(response_data)
+        text = self.extract_responses_text(response_data) if api_format == "responses" else self.extract_text(response_data)
         return text, json.dumps(response_data, ensure_ascii=False, indent=2)
 
 

@@ -53,6 +53,30 @@ class OpenAICompatibleLLMNodeTests(unittest.TestCase):
         self.assertEqual(payload["reasoning_effort"], "medium")
         self.assertEqual(payload["messages"], [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}])
 
+    def test_build_responses_payload_uses_input_image_and_reasoning_object(self):
+        node = llm_module.OpenAICompatibleLLMNode()
+        payload = node.build_responses_payload(
+            model="gpt-5.6-sol",
+            system_prompt="Be concise",
+            prompt="Describe these images",
+            thinking_mode="high",
+            image_parts=[
+                {"type": "image_url", "image_url": {"url": "https://cdn.example.com/1.png"}},
+                {"type": "image_url", "image_url": {"url": "https://cdn.example.com/2.png"}},
+            ],
+            temperature=0.5,
+            max_tokens=1000,
+        )
+
+        self.assertEqual(payload["reasoning"], {"effort": "high"})
+        self.assertEqual(payload["max_output_tokens"], 1000)
+        self.assertEqual(payload["instructions"], "Be concise")
+        self.assertEqual(
+            [part["type"] for part in payload["input"][0]["content"]],
+            ["input_text", "input_image", "input_image"],
+        )
+        self.assertEqual(payload["input"][0]["content"][1]["image_url"], "https://cdn.example.com/1.png")
+
     def test_image_mode_none_does_not_encode_or_upload_images(self):
         node = llm_module.OpenAICompatibleLLMNode()
         with mock.patch.object(node, "encode_image_data_url") as encode, mock.patch.object(node, "upload_image") as upload:
@@ -85,6 +109,27 @@ class OpenAICompatibleLLMNodeTests(unittest.TestCase):
         post.assert_called_once()
         self.assertEqual(post.call_args.kwargs["json"]["reasoning_effort"], "xhigh")
         self.assertEqual(post.call_args.args[0], "https://example.com/v1/chat/completions")
+        self.assertTrue(response.closed)
+
+    def test_generate_uses_responses_endpoint_and_extracts_output_text(self):
+        node = llm_module.OpenAICompatibleLLMNode()
+        response = FakeResponse({"id": "resp-test", "output_text": "Responses hello"})
+        with mock.patch.object(llm_module.requests, "post", return_value=response) as post:
+            result = node.generate(
+                api_key="key",
+                base_url="https://example.com/v1",
+                model="gpt-5.6-sol",
+                system_prompt="",
+                prompt="Hi",
+                thinking_mode="medium",
+                image_mode="none",
+                api_format="responses",
+            )
+
+        self.assertEqual(result[0], "Responses hello")
+        self.assertEqual(post.call_args.args[0], "https://example.com/v1/responses")
+        self.assertEqual(post.call_args.kwargs["json"]["reasoning"], {"effort": "medium"})
+        self.assertIn("max_output_tokens", post.call_args.kwargs["json"])
         self.assertTrue(response.closed)
 
     def test_extract_text_supports_structured_content(self):

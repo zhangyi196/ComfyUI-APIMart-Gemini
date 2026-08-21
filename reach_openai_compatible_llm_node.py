@@ -26,7 +26,8 @@ except ImportError:
 class ReachOpenAICompatibleLLMNode:
     """ComfyUI node for ReachAPI OpenAI-compatible LLM Responses and Chat APIs."""
 
-    DEFAULT_BASE_URL = "https://api.reachapi.ai/v1"
+    DEFAULT_BASE_URL = "https://direct.reachapi.ai/v1"
+    DIRECT_HOST = "direct.reachapi.ai"
     FILE_UPLOAD_URL = "https://file.reachapi.ai/file/uploads"
     MODEL_CHOICES = ["gpt-5.6-sol", "gpt-5.6-luna"]
     THINKING_CHOICES = ["medium", "high", "xhigh"]
@@ -65,6 +66,8 @@ class ReachOpenAICompatibleLLMNode:
                 "request_timeout": ("INT", {"default": 300, "min": 10, "max": 1800}),
                 "poll_interval": ("INT", {"default": 4, "min": 1, "max": 60}),
                 "max_polls": ("INT", {"default": 90, "min": 1, "max": 600}),
+                # 默认关闭 SSE，降低长耗时图像请求被代理中断的概率。
+                "stream": ("BOOLEAN", {"default": False}),
                 **optional_images,
             },
         }
@@ -115,6 +118,10 @@ class ReachOpenAICompatibleLLMNode:
             self._active_session = session
         return session
 
+    def should_bypass_proxy(self, url: str) -> bool:
+        """官方 direct 域名需要绕过 ComfyUI 继承的系统代理。"""
+        return (urlsplit(url).hostname or "").lower() == self.DIRECT_HOST
+
     def close_http_session(self) -> None:
         with self._session_lock:
             session = self._active_session
@@ -162,6 +169,11 @@ class ReachOpenAICompatibleLLMNode:
         else:
             timeout = min(float(timeout), total_timeout)
 
+        original_trust_env = getattr(session, "trust_env", True)
+        if self.should_bypass_proxy(url):
+            session.trust_env = False
+            print(f"[ReachOpenAICompatibleLLMNode] 直连请求（绕过系统代理）: {url}", flush=True)
+
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             future = executor.submit(session.request, method, url, timeout=timeout, **kwargs)
@@ -187,6 +199,7 @@ class ReachOpenAICompatibleLLMNode:
                     continue
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+            session.trust_env = original_trust_env
 
     def tensor_to_png_bytes(self, tensor: Any) -> bytes:
         if torch is not None and isinstance(tensor, torch.Tensor):
@@ -308,6 +321,7 @@ class ReachOpenAICompatibleLLMNode:
         image_parts: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        stream: bool = False,
     ) -> Dict[str, Any]:
         if api_format not in self.API_FORMAT_CHOICES:
             raise ValueError(f"不支持的 api_format: {api_format}")
@@ -324,8 +338,7 @@ class ReachOpenAICompatibleLLMNode:
                 "reasoning": {"effort": thinking_mode},
                 "temperature": temperature,
                 "max_output_tokens": max_tokens,
-                # Reach Responses API 使用 SSE 返回长耗时任务的增量结果。
-                "stream": True,
+                "stream": bool(stream),
             }
             if system_prompt.strip():
                 payload["instructions"] = system_prompt
@@ -342,7 +355,37 @@ class ReachOpenAICompatibleLLMNode:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "reasoning_effort": thinking_mode,
+            "stream": bool(stream),
         }
+
+    def _extract_stream_text_delta(self, event_data: Dict[str, Any], api_format: str) -> str:
+        """提取 Responses 或 Chat Completions SSE 事件中的文本增量。"""
+        if api_format == "responses":
+            delta = event_data.get("delta")
+            if isinstance(delta, str):
+                return delta
+            return ""
+
+        choices = event_data.get("choices")
+        if not isinstance(choices, list):
+            return ""
+        text_parts: List[str] = []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                text_parts.extend(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                )
+        return "".join(text_parts)
 
     def _finish_sse_event(
         self,
@@ -351,6 +394,7 @@ class ReachOpenAICompatibleLLMNode:
         events: List[Dict[str, Any]],
         text_parts: List[str],
         event_counts: Dict[str, int],
+        api_format: str = "responses",
     ) -> Optional[Dict[str, Any]]:
         """解析一个 SSE 事件，并返回事件 JSON。"""
         if not data_lines:
@@ -385,18 +429,18 @@ class ReachOpenAICompatibleLLMNode:
             "error",
         }
         is_delta = event_name in {"response.output_text.delta", "response.text.delta"}
+        is_chat_chunk = api_format == "chat_completions" and (
+            event_name in {"message", "chat.completion.chunk"} or "choices" in event_data
+        )
         if event_name in major_events or (is_delta and event_count == 1):
             print(f"[ReachOpenAICompatibleLLMNode] SSE {event_name}", flush=True)
 
-        if event_name in {"response.output_text.delta", "response.text.delta"}:
-            delta = event_data.get("delta")
-            if isinstance(delta, str):
-                text_parts.append(delta)
+        if is_delta or is_chat_chunk:
+            delta_text = self._extract_stream_text_delta(event_data, api_format)
+            if delta_text:
+                text_parts.append(delta_text)
                 if event_count == 1:
-                    print(
-                        "[ReachOpenAICompatibleLLMNode] 已开始接收输出文本",
-                        flush=True,
-                    )
+                    print("[ReachOpenAICompatibleLLMNode] 已开始接收输出文本", flush=True)
         elif event_name in {"response.output_text.done", "response.text.done"}:
             done_text = event_data.get("text")
             if isinstance(done_text, str) and done_text and not text_parts:
@@ -405,8 +449,33 @@ class ReachOpenAICompatibleLLMNode:
             raise RuntimeError(f"Reach Responses SSE 任务失败: {event_data}")
         return event
 
-    def read_sse_response(self, response: requests.Response, total_timeout: float = 300) -> Dict[str, Any]:
-        """读取 Reach Responses 的 SSE，持续输出进度并合并文本增量。"""
+    def extract_task_metadata(self, response_data: Any) -> Dict[str, str]:
+        """提取 Reach 平台任务 ID 与上游第三方任务 ID。"""
+        if not isinstance(response_data, dict):
+            return {}
+        metadata: Dict[str, str] = {}
+        task_id = response_data.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            metadata["task_id"] = task_id
+        for key in ("third_party_task_id", "thirdPartyTaskId", "provider_task_id"):
+            value = response_data.get(key)
+            if isinstance(value, str) and value:
+                metadata["third_party_task_id"] = value
+                break
+        nested = response_data.get("data")
+        if isinstance(nested, dict):
+            nested_metadata = self.extract_task_metadata(nested)
+            for key, value in nested_metadata.items():
+                metadata.setdefault(key, value)
+        return metadata
+
+    def read_sse_response(
+        self,
+        response: requests.Response,
+        total_timeout: float = 300,
+        api_format: str = "responses",
+    ) -> Dict[str, Any]:
+        """读取 Reach Responses 或 Chat Completions 的 SSE。"""
         events: List[Dict[str, Any]] = []
         text_parts: List[str] = []
         current_event = "message"
@@ -415,6 +484,7 @@ class ReachOpenAICompatibleLLMNode:
         last_data: Dict[str, Any] = {}
         event_counts: Dict[str, int] = {}
         completed = False
+        task_metadata: Dict[str, str] = {}
 
         # 使用较小的 chunk，避免代理将多个 SSE 事件缓冲后才交给 ComfyUI。
         # 在独立线程读取 socket，主线程每秒检查中断并输出等待进度。否则代理长时间
@@ -459,10 +529,16 @@ class ReachOpenAICompatibleLLMNode:
                 raw_line = raw_line.decode("utf-8", errors="replace")
             line = raw_line.rstrip("\r") if raw_line is not None else ""
             if not line:
-                event = self._finish_sse_event(current_event, data_lines, events, text_parts, event_counts)
+                event = self._finish_sse_event(
+                    current_event, data_lines, events, text_parts, event_counts, api_format
+                )
                 if event is not None and isinstance(event.get("data"), dict):
                     last_data = event["data"]
-                if event is not None and event.get("event") in {"response.completed", "response.failed", "response.error", "error"}:
+                    task_metadata.update(self.extract_task_metadata(event["data"]))
+                if event is not None and (
+                    event.get("event") in {"response.completed", "response.failed", "response.error", "error"}
+                    or event.get("data") == "[DONE]"
+                ):
                     completed = True
                 current_event = "message"
                 data_lines = []
@@ -480,9 +556,10 @@ class ReachOpenAICompatibleLLMNode:
                 plain_lines.append(line)
 
         # 允许没有以空行结尾的最后一个事件。
-        event = self._finish_sse_event(current_event, data_lines, events, text_parts, event_counts)
+        event = self._finish_sse_event(current_event, data_lines, events, text_parts, event_counts, api_format)
         if event is not None and isinstance(event.get("data"), dict):
             last_data = event["data"]
+            task_metadata.update(self.extract_task_metadata(event["data"]))
 
         if not events and not text_parts and plain_lines:
             raw_body = "\n".join(plain_lines).strip()
@@ -500,6 +577,7 @@ class ReachOpenAICompatibleLLMNode:
             "output_text": text,
             "events": events,
             "stream": True,
+            **task_metadata,
         }
         if not text:
             # 某些网关只在 completed 事件中携带完整 output。
@@ -539,7 +617,22 @@ class ReachOpenAICompatibleLLMNode:
                     body = "<empty>"
             raise RuntimeError(f"Reach {context}失败（HTTP {response.status_code}）: {body[:4000]}") from exc
 
-    def extract_task_id(self, response_data: Dict[str, Any]) -> Optional[str]:
+    def raise_for_api_error(self, response_data: Any, context: str) -> None:
+        """识别 HTTP 200 但业务层返回的错误，避免被误报为缺少文本。"""
+        if not isinstance(response_data, dict):
+            return
+        error = response_data.get("error")
+        if error:
+            detail = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+            raise RuntimeError(f"Reach {context}业务失败: {detail[:4000]}")
+        code = response_data.get("code")
+        if isinstance(code, int) and code >= 400:
+            detail = response_data.get("msg") or response_data
+            raise RuntimeError(f"Reach {context}业务失败（code={code}）: {detail}")
+
+    def extract_task_id(self, response_data: Any) -> Optional[str]:
+        if not isinstance(response_data, dict):
+            return None
         candidates = [
             response_data.get("task_id"),
             response_data.get("id") if response_data.get("object") in {"task", "response.task"} else None,
@@ -614,6 +707,7 @@ class ReachOpenAICompatibleLLMNode:
             try:
                 self.raise_for_status_with_body(response, "任务轮询")
                 response_data = response.json()
+                self.raise_for_api_error(response_data, "任务轮询")
                 status = self.get_status(response_data)
                 print(
                     f"[ReachOpenAICompatibleLLMNode] 轮询 {poll_count}/{max_polls}: "
@@ -651,6 +745,7 @@ class ReachOpenAICompatibleLLMNode:
             timeout = int(kwargs.get("request_timeout", 300))
             poll_interval = int(kwargs.get("poll_interval", self.poll_interval))
             max_polls = int(kwargs.get("max_polls", self.max_polls))
+            stream = bool(kwargs.get("stream", False))
             images = self.collect_images(**kwargs)
             upload_url = self.resolve_upload_url(kwargs.get("upload_url", "")) if image_mode == "reach_upload" else ""
             upload_api_key = kwargs.get("upload_api_key", "").strip() or api_key
@@ -672,19 +767,23 @@ class ReachOpenAICompatibleLLMNode:
                 image_parts=image_parts,
                 temperature=float(kwargs.get("temperature", 1.0)),
                 max_tokens=int(kwargs.get("max_tokens", 4096)),
+                stream=stream,
             )
             submit_url = self.build_submit_url(base_url, api_format)
             query_url = self.build_query_url(base_url)
             print(
                 f"[ReachOpenAICompatibleLLMNode] 提交任务: format={api_format}, model={model}, "
-                f"images={len(images)}, url={submit_url}"
+                f"images={len(images)}, stream={stream}, url={submit_url}"
             )
             request_headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             }
-            if api_format == "responses":
+            use_stream = stream
+            if use_stream:
                 request_headers["Accept"] = "text/event-stream"
+            else:
+                request_headers["Accept"] = "application/json"
             response = self.request_with_interrupt(
                 session,
                 "POST",
@@ -693,41 +792,62 @@ class ReachOpenAICompatibleLLMNode:
                 progress_label=f"POST {submit_url}",
                 headers=request_headers,
                 json=payload,
-                stream=api_format == "responses",
+                stream=use_stream,
             )
             try:
-                self.raise_for_status_with_body(response, f"Responses 请求（图像数={len(images)}）")
-                if api_format == "responses" and self.is_sse_response(response):
+                self.raise_for_status_with_body(response, f"{api_format} 请求（图像数={len(images)}）")
+                if use_stream and self.is_sse_response(response):
                     print("[ReachOpenAICompatibleLLMNode] 已连接 SSE，开始接收 Reach 后台进度", flush=True)
-                    final_data = self.read_sse_response(response, total_timeout=timeout)
+                    final_data = self.read_sse_response(
+                        response, total_timeout=timeout, api_format=api_format
+                    )
                     submit_data = {
                         "stream": True,
                         "events": final_data.get("events", []),
                     }
                 else:
-                    if api_format == "responses":
+                    if stream:
                         print(
                             "[ReachOpenAICompatibleLLMNode] Reach 未返回 SSE，按普通 JSON 读取；"
                             "如果请求仍在后台处理，请检查中转站是否支持 stream=true",
                             flush=True,
                         )
                     submit_data = response.json()
+                    self.raise_for_api_error(submit_data, f"{api_format} 请求")
+                    initial_metadata = self.extract_task_metadata(submit_data)
+                    if initial_metadata.get("task_id"):
+                        print(
+                            f"[ReachOpenAICompatibleLLMNode] 已收到 Reach task_id: "
+                            f"{initial_metadata['task_id']}",
+                            flush=True,
+                        )
                     final_data = None
             finally:
                 response.close()
 
             task_id = self.extract_task_id(submit_data)
             if final_data is None:
-                final_data = (
-                    self.poll_task_status(session, task_id, api_key, query_url, poll_interval, max_polls)
-                    if task_id
-                    else submit_data
-                )
+                # Chat/Responses 的非流式接口返回的是最终响应；即使响应中附带
+                # task_id，也不能把它误当成 /tasks/{id} 的异步提交结果。
+                # 只有响应没有可读文本、明确是任务接受响应时才使用兼容轮询。
+                try:
+                    self.raise_for_api_error(submit_data, f"{api_format} 请求")
+                    self.extract_text(submit_data)
+                    final_data = submit_data
+                except ValueError:
+                    final_data = (
+                        self.poll_task_status(session, task_id, api_key, query_url, poll_interval, max_polls)
+                        if task_id
+                        else submit_data
+                    )
             text = self.extract_text(final_data)
+            task_metadata = self.extract_task_metadata(submit_data)
+            task_metadata.update(self.extract_task_metadata(final_data))
             result = {
                 "submit_url": submit_url,
                 "query_url": query_url,
-                "task_id": task_id,
+                "task_id": task_metadata.get("task_id", task_id),
+                "third_party_task_id": task_metadata.get("third_party_task_id"),
                 "uploaded_image_count": len(images) if image_mode == "reach_upload" else 0,
                 "submit_response": submit_data,
                 "final_response": final_data,

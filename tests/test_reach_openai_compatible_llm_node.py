@@ -54,6 +54,8 @@ class FakeSSEResponse(FakeResponse):
 
 
 class FakeSession:
+    trust_env = True
+
     def close(self):
         pass
 
@@ -70,6 +72,28 @@ class ReachOpenAICompatibleLLMNodeTests(unittest.TestCase):
             "https://api.reachapi.ai/v1/tasks",
         )
 
+    def test_default_base_url_is_reach_direct_endpoint(self):
+        self.assertEqual(
+            reach_module.ReachOpenAICompatibleLLMNode.DEFAULT_BASE_URL,
+            "https://direct.reachapi.ai/v1",
+        )
+
+    def test_direct_endpoint_bypasses_system_proxy(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        session = FakeSession()
+        session.request = mock.Mock(return_value=FakeResponse({"ok": True}))
+        response = node.request_with_interrupt(
+            session,
+            "POST",
+            "https://direct.reachapi.ai/v1/chat/completions",
+            total_timeout=1,
+            json={},
+        )
+        self.assertTrue(response.json()["ok"])
+        self.assertTrue(session.trust_env)
+        session.request.assert_called_once()
+        self.assertEqual(session.request.call_args.kwargs["timeout"], (10, 1))
+
     def test_build_responses_payload_uses_input_images(self):
         node = reach_module.ReachOpenAICompatibleLLMNode()
         payload = node.build_payload(
@@ -83,9 +107,24 @@ class ReachOpenAICompatibleLLMNodeTests(unittest.TestCase):
             max_tokens=100,
         )
         self.assertEqual(payload["reasoning"], {"effort": "high"})
-        self.assertTrue(payload["stream"])
+        self.assertFalse(payload["stream"])
         self.assertEqual(payload["input"][0]["content"][1]["type"], "input_image")
         self.assertEqual(payload["instructions"], "system")
+
+    def test_build_responses_payload_can_disable_streaming(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        payload = node.build_payload(
+            api_format="responses",
+            model="gpt-5.6-sol",
+            system_prompt="",
+            prompt="describe the image",
+            thinking_mode="medium",
+            image_parts=[],
+            temperature=1.0,
+            max_tokens=100,
+            stream=False,
+        )
+        self.assertFalse(payload["stream"])
 
     def test_collect_images_splits_comfyui_image_batch(self):
         node = reach_module.ReachOpenAICompatibleLLMNode()
@@ -131,6 +170,7 @@ class ReachOpenAICompatibleLLMNodeTests(unittest.TestCase):
                 prompt="describe all images",
                 thinking_mode="medium",
                 image_mode="none",
+                stream=True,
             )
 
         self.assertEqual(result[0], "final prompt")
@@ -157,11 +197,122 @@ class ReachOpenAICompatibleLLMNodeTests(unittest.TestCase):
                 prompt="describe all images",
                 thinking_mode="xhigh",
                 image_mode="none",
+                stream=True,
             )
 
         self.assertEqual(result[0], "json result")
         self.assertTrue(request.call_args.kwargs["stream"])
         self.assertTrue(response.closed)
+
+    def test_generate_uses_non_streaming_responses_when_requested(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        response = FakeResponse({"id": "resp-json", "status": "completed", "output_text": "json result"})
+
+        with mock.patch.object(node, "open_http_session", return_value=FakeSession()), \
+            mock.patch.object(node, "close_http_session"), \
+            mock.patch.object(node, "request_with_interrupt", return_value=response) as request:
+            result = node.generate(
+                api_key="key",
+                base_url="https://api.reachapi.ai/v1",
+                api_format="responses",
+                model="gpt-5.6-luna",
+                system_prompt="",
+                prompt="describe all images",
+                thinking_mode="high",
+                image_mode="none",
+                stream=False,
+            )
+
+        self.assertEqual(result[0], "json result")
+        self.assertFalse(request.call_args.kwargs["stream"])
+        self.assertFalse(request.call_args.kwargs["json"]["stream"])
+        self.assertEqual(request.call_args.kwargs["headers"]["Accept"], "application/json")
+        self.assertTrue(response.closed)
+
+    def test_generate_reads_chat_completions_sse(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        response = FakeSSEResponse(
+            [
+                'data: {"id":"chat-123","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}',
+                "",
+                'data: {"choices":[{"delta":{"content":"hello"}}]}',
+                "",
+                'data: {"choices":[{"delta":{"content":" world"}}]}',
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        with mock.patch.object(node, "open_http_session", return_value=FakeSession()), \
+            mock.patch.object(node, "close_http_session"), \
+            mock.patch.object(node, "request_with_interrupt", return_value=response) as request:
+            result = node.generate(
+                api_key="key",
+                base_url="https://api.reachapi.ai/v1",
+                api_format="chat_completions",
+                model="gpt-5.6-sol",
+                system_prompt="",
+                prompt="say hello",
+                thinking_mode="medium",
+                image_mode="none",
+                stream=True,
+            )
+
+        self.assertEqual(result[0], "hello world")
+        self.assertTrue(request.call_args.kwargs["json"]["stream"])
+        self.assertTrue(request.call_args.kwargs["stream"])
+        self.assertTrue(response.closed)
+
+    def test_business_error_is_reported_for_http_200_json(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        response = FakeResponse({"error": {"message": "too many images"}})
+        with mock.patch.object(node, "open_http_session", return_value=FakeSession()), \
+            mock.patch.object(node, "close_http_session"), \
+            mock.patch.object(node, "request_with_interrupt", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "too many images"):
+                node.generate(
+                    api_key="key",
+                    base_url="https://api.reachapi.ai/v1",
+                    api_format="chat_completions",
+                    model="gpt-5.6-sol",
+                    system_prompt="",
+                    prompt="say hello",
+                    thinking_mode="medium",
+                    image_mode="none",
+                    stream=False,
+                )
+
+    def test_final_chat_response_with_task_ids_is_not_polled(self):
+        node = reach_module.ReachOpenAICompatibleLLMNode()
+        response = FakeResponse(
+            {
+                "task_id": "reach-task-1",
+                "third_party_task_id": "provider-task-1",
+                "object": "chat.completion",
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            }
+        )
+        with mock.patch.object(node, "open_http_session", return_value=FakeSession()), \
+            mock.patch.object(node, "close_http_session"), \
+            mock.patch.object(node, "poll_task_status") as poll, \
+            mock.patch.object(node, "request_with_interrupt", return_value=response):
+            result = node.generate(
+                api_key="key",
+                base_url="https://direct.reachapi.ai/v1",
+                api_format="chat_completions",
+                model="gpt-5.6-sol",
+                system_prompt="",
+                prompt="say done",
+                thinking_mode="medium",
+                image_mode="none",
+                stream=False,
+            )
+
+        self.assertEqual(result[0], "done")
+        self.assertFalse(poll.called)
+        self.assertIn('"task_id": "reach-task-1"', result[1])
+        self.assertIn('"third_party_task_id": "provider-task-1"', result[1])
 
     def test_read_sse_reports_delayed_stream_without_blocking_main_thread(self):
         node = reach_module.ReachOpenAICompatibleLLMNode()
